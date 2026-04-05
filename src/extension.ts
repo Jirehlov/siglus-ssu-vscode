@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import {
-	LanguageClient,
+	type LanguageClient,
 	type LanguageClientOptions,
 	type ServerOptions,
 } from 'vscode-languageclient/node';
@@ -338,6 +338,7 @@ function endScanProgress(params: ScanStatusParams): void {
 }
 
 async function startLanguageClient(): Promise<void> {
+	const { LanguageClient } = await import('vscode-languageclient/node');
 	const outputChannel = getServerOutputChannel();
 	const settings = getSettings();
 	const commandSpec = resolveCommandSpec(settings.configuredPath);
@@ -397,6 +398,11 @@ function isMissingCommandError(error: unknown): boolean {
 	return /\bENOENT\b/i.test(message) || /\bnot recognized\b/i.test(message);
 }
 
+function isMissingLanguageClientModuleError(error: unknown): boolean {
+	const message = toErrorMessage(error);
+	return /Cannot find module ['"]vscode-languageclient\/node['"]/i.test(message);
+}
+
 function configurationTarget(): vscode.ConfigurationTarget {
 	return primaryWorkspaceFolder()
 		? vscode.ConfigurationTarget.Workspace
@@ -427,6 +433,12 @@ function openSiglusSsuInstallTerminal(): void {
 
 async function handleLanguageServerStartError(error: unknown): Promise<void> {
 	serverOutput?.show(true);
+	if (isMissingLanguageClientModuleError(error)) {
+		void vscode.window.showErrorMessage(
+			'SiglusSS extension package is missing the vscode-languageclient runtime. Reinstall or update the VSIX.',
+		);
+		return;
+	}
 	if (!isMissingCommandError(error)) {
 		void vscode.window.showErrorMessage(
 			`Failed to start SiglusSS language server. Check siglusSS.siglusSsuPath. ${toErrorMessage(error)}`,

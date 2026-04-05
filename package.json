@@ -2,7 +2,7 @@
   "name": "siglus-ssu-vscode",
   "displayName": "SiglusSS Support",
   "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -23,6 +23,7 @@
   "main": "./out/extension.js",
   "files": [
     "out",
+    "node_modules",
     "syntaxes",
     "language-configuration.json",
     "README.md",
