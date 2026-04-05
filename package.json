@@ -1,0 +1,193 @@
+{
+  "name": "siglus-ssu-vscode",
+  "displayName": "SiglusSS Support",
+  "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
+  "version": "0.0.1",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Jirehlov/SiglusSceneScriptUtility.git"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "activationEvents": [
+    "onLanguage:siglusss",
+    "onCommand:siglusSS.restartLanguageServer"
+  ],
+  "main": "./out/extension.js",
+  "files": [
+    "out",
+    "syntaxes",
+    "language-configuration.json",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "siglusss",
+        "aliases": [
+          "SiglusSS",
+          "SiglusSceneScript"
+        ],
+        "extensions": [
+          ".ss",
+          ".inc"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "siglusss",
+        "scopeName": "source.siglusss",
+        "path": "./syntaxes/siglusss.tmLanguage.json"
+      }
+    ],
+    "semanticTokenTypes": [
+      {
+        "id": "dialogue",
+        "superType": "string",
+        "description": "Dialogue text classified by siglus-ssu textmap semantics."
+      },
+      {
+        "id": "element",
+        "superType": "function",
+        "description": "System elements classified by the Siglus compiler tables."
+      },
+      {
+        "id": "speakerName",
+        "superType": "type",
+        "description": "Speaker-name text classified by siglus-ssu compiler semantics."
+      }
+    ],
+    "semanticTokenScopes": [
+      {
+        "language": "siglusss",
+        "scopes": {
+          "dialogue": [
+            "markup.quote.siglusss",
+            "markup.inserted.siglusss",
+            "string.quoted.double.siglusss",
+            "string.quoted.single.siglusss"
+          ],
+          "element": [
+            "support.function.siglusss",
+            "support.variable.siglusss",
+            "support.function",
+            "support.variable"
+          ],
+          "speakerName": [
+            "entity.name.section.siglusss",
+            "entity.name.type.siglusss",
+            "markup.heading.siglusss"
+          ]
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "siglusSS.restartLanguageServer",
+        "title": "SiglusSS: Restart Language Server"
+      }
+    ],
+    "configurationDefaults": {
+      "[siglusss]": {
+        "editor.semanticHighlighting.enabled": true,
+        "files.encoding": "shiftjis",
+        "files.autoGuessEncoding": true
+      },
+      "editor.semanticTokenColorCustomizations": {
+        "enabled": true,
+        "rules": {
+          "dialogue:siglusss": {
+            "foreground": "#F6A400"
+          },
+          "element:siglusss": {
+            "foreground": "#12B5A5",
+            "bold": true
+          },
+          "speakerName:siglusss": {
+            "foreground": "#3BA8FF",
+            "bold": true
+          }
+        }
+      },
+      "editor.tokenColorCustomizations": {
+        "textMateRules": [
+          {
+            "scope": [
+              "markup.quote.siglusss",
+              "markup.inserted.siglusss",
+              "string.quoted.double.siglusss",
+              "string.quoted.single.siglusss"
+            ],
+            "settings": {
+              "foreground": "#F6A400"
+            }
+          },
+          {
+            "scope": [
+              "meta.speaker.siglusss",
+              "entity.name.section.siglusss",
+              "entity.name.type.siglusss",
+              "markup.heading.siglusss"
+            ],
+            "settings": {
+              "foreground": "#3BA8FF",
+              "fontStyle": "bold"
+            }
+          },
+          {
+            "scope": [
+              "punctuation.definition.string.begin.siglusss",
+              "punctuation.definition.string.end.siglusss"
+            ],
+            "settings": {
+              "foreground": "#FF4F8B",
+              "fontStyle": "bold"
+            }
+          }
+        ]
+      }
+    },
+    "configuration": {
+      "title": "SiglusSS",
+      "properties": {
+        "siglusSS.siglusSsuPath": {
+          "type": "string",
+          "default": "siglus-ssu",
+          "markdownDescription": "Either the path to the `siglus-ssu` executable, or the root directory of a `uv` project that should run `uv run siglus-ssu`. Leave it as `siglus-ssu` to use the command installed into PATH, such as a pip-installed command."
+        },
+        "siglusSS.serverExtraArgs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "markdownDescription": "Extra arguments passed to `siglus-ssu -lsp`."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/vscode": "^1.90.0",
+    "typescript": "^5.7.3"
+  }
+}

@@ -1,0 +1,132 @@
+{
+  "scopeName": "source.siglusss",
+  "name": "SiglusSS",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#speakerNames"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#directives"
+    },
+    {
+      "include": "#labels"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#numbers"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.semicolon.siglusss",
+          "match": ";.*$"
+        },
+        {
+          "name": "comment.line.double-slash.siglusss",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.siglusss",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "speakerNames": {
+      "patterns": [
+        {
+          "name": "meta.speaker.siglusss",
+          "begin": "【",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.begin.siglusss"
+            }
+          },
+          "contentName": "entity.name.type.siglusss",
+          "end": "】",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.definition.string.end.siglusss"
+            }
+          }
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.siglusss",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.siglusss",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.siglusss",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.siglusss",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "directives": {
+      "patterns": [
+        {
+          "name": "keyword.control.directive.siglusss",
+          "match": "(?i)#(?:replace|define_s|define|macro|property|command|expand|ifdef|elseifdef|else|endif|inc_start|inc_end)\\b"
+        }
+      ]
+    },
+    "labels": {
+      "patterns": [
+        {
+          "name": "entity.name.label.siglusss",
+          "match": "#(?:z\\d{1,3}|[A-Za-z0-9_]+)"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.siglusss",
+          "match": "(?i)\\b(?:command|property|goto|gosub|gosubstr|return|if|elseif|else|for|while|continue|break|switch|case|default)\\b"
+        },
+        {
+          "name": "storage.type.siglusss",
+          "match": "(?i)\\b(?:void|int|str|intlist|strlist|scene|global|mwnd|label|list|call|intref|strref|intlistref|strlistref)\\b"
+        },
+        {
+          "name": "entity.name.macro.siglusss",
+          "match": "@[A-Za-z0-9_$@]+"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.siglusss",
+          "match": "\\b(?:0x[0-9A-Fa-f]+|0b[01]+|\\d+)\\b"
+        }
+      ]
+    }
+  }
+}

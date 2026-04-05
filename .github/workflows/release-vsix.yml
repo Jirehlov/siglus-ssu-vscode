@@ -1,0 +1,76 @@
+name: Release VSIX
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Git tag for the release. Defaults to v<package.json version>.
+        required: false
+        type: string
+      release_name:
+        description: Release title. Defaults to the resolved tag.
+        required: false
+        type: string
+      prerelease:
+        description: Mark the GitHub Release as a prerelease.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        run: |
+          PKG_NAME="$(node -p "require('./package.json').name")"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          TAG="${{ github.event.inputs.tag }}"
+          RELEASE_NAME="${{ github.event.inputs.release_name }}"
+
+          if [ -z "$TAG" ]; then
+            TAG="v$PKG_VERSION"
+          fi
+
+          if [ -z "$RELEASE_NAME" ]; then
+            RELEASE_NAME="$TAG"
+          fi
+
+          mkdir -p dist
+          VSIX_PATH="dist/${PKG_NAME}-${PKG_VERSION}.vsix"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "release_name=$RELEASE_NAME" >> "$GITHUB_OUTPUT"
+          echo "vsix_path=$VSIX_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Build and package VSIX
+        run: npx --yes @vscode/vsce package --out "${{ steps.meta.outputs.vsix_path }}"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ${{ steps.meta.outputs.release_name }}
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          generate_release_notes: true
+          overwrite_files: true
+          files: ${{ steps.meta.outputs.vsix_path }}
