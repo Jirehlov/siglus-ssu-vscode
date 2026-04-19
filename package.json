@@ -2,12 +2,12 @@
   "name": "siglus-ssu-vscode",
   "displayName": "SiglusSS Support",
   "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "publisher": "Jirehlov",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/Jirehlov/SiglusSceneScriptUtility.git"
+    "url": "https://github.com/Jirehlov/siglus-ssu-vscode.git"
   },
   "engines": {
     "vscode": "^1.90.0"
@@ -69,6 +69,12 @@
         "description": "Speaker-name text classified by siglus-ssu compiler semantics."
       }
     ],
+    "semanticTokenModifiers": [
+      {
+        "id": "unused",
+        "description": "Marks declarations that are never referenced in the current workspace scan."
+      }
+    ],
     "semanticTokenScopes": [
       {
         "language": "siglusss",
@@ -118,6 +124,10 @@
           "speakerName:siglusss": {
             "foreground": "#3BA8FF",
             "bold": true
+          },
+          "macro.unused:siglusss": {
+            "foreground": "#7F8790",
+            "italic": true
           }
         }
       },
