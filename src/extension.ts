@@ -1,3 +1,4 @@
+import { spawn } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -11,7 +12,6 @@ import {
 let client: LanguageClient | undefined;
 let serverOutput: vscode.OutputChannel | undefined;
 const siglusEncodingJobs = new Map<string, Promise<void>>();
-const siglusScanJobs = new Map<string, ScanProgressEntry>();
 const SIGLUS_ENCODINGS = ['shiftjis', 'utf8bom', 'utf8'] as const;
 
 type ExtensionSettings = {
@@ -31,22 +31,12 @@ type DecodedCandidate = {
 	text: string | undefined;
 };
 
-type ScanStatusParams = {
-	phase: 'begin' | 'report' | 'end';
-	kind: string;
-	directory: string;
-	title: string;
-	current: number;
-	total: number;
-	message?: string;
-};
-
-type ScanProgressEntry = {
-	report: (value: { message?: string; increment?: number }) => void;
-	resolve: () => void;
-	lastPercent: number;
-	pending: Array<{ message?: string; increment?: number }>;
-};
+class MissingSiglusSsuError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'MissingSiglusSsuError';
+	}
+}
 
 function getServerOutputChannel(): vscode.OutputChannel {
 	if (!serverOutput) {
@@ -257,91 +247,12 @@ async function ensureSiglusEncoding(document: vscode.TextDocument): Promise<void
 	return job;
 }
 
-function scanProgressKey(params: ScanStatusParams): string {
-	return `${params.kind}:${params.directory}`;
-}
-
-function beginScanProgress(params: ScanStatusParams): void {
-	const key = scanProgressKey(params);
-	if (siglusScanJobs.has(key)) {
-		return;
-	}
-	let resolveProgress!: () => void;
-	const entry: ScanProgressEntry = {
-		report: (value) => {
-			entry.pending.push(value);
-		},
-		resolve: () => {
-			resolveProgress();
-		},
-		lastPercent: 0,
-		pending: params.message ? [{ message: params.message }] : [],
-	};
-	siglusScanJobs.set(key, entry);
-	const done = new Promise<void>((resolve) => {
-		resolveProgress = resolve;
-	});
-	void vscode.window.withProgress(
-		{
-			location: vscode.ProgressLocation.Notification,
-			title: params.title,
-			cancellable: false,
-		},
-		async (progress) => {
-			entry.report = (value) => {
-				progress.report(value);
-			};
-			for (const value of entry.pending) {
-				progress.report(value);
-			}
-			entry.pending = [];
-			try {
-				await done;
-			} finally {
-				siglusScanJobs.delete(key);
-			}
-		},
-	);
-}
-
-function reportScanProgress(params: ScanStatusParams): void {
-	const entry = siglusScanJobs.get(scanProgressKey(params));
-	if (!entry) {
-		beginScanProgress(params);
-		return;
-	}
-	const nextPercent =
-		params.total > 0 ? Math.min(100, Math.round((params.current / params.total) * 100)) : 100;
-	const increment = Math.max(0, nextPercent - entry.lastPercent);
-	entry.lastPercent = nextPercent;
-	entry.report({
-		message: params.message,
-		increment,
-	});
-}
-
-function endScanProgress(params: ScanStatusParams): void {
-	const entry = siglusScanJobs.get(scanProgressKey(params));
-	if (!entry) {
-		return;
-	}
-	if (params.total > 0) {
-		const nextPercent = Math.min(100, Math.round((params.current / params.total) * 100));
-		const increment = Math.max(0, nextPercent - entry.lastPercent);
-		entry.lastPercent = nextPercent;
-		entry.report({
-			message: params.message,
-			increment,
-		});
-	}
-	entry.resolve();
-}
-
 async function startLanguageClient(): Promise<void> {
 	const { LanguageClient } = await import('vscode-languageclient/node');
 	const outputChannel = getServerOutputChannel();
 	const settings = getSettings();
 	const commandSpec = resolveCommandSpec(settings.configuredPath);
+	await ensureLanguageServerCommandAvailable(commandSpec);
 	const serverOptions: ServerOptions = {
 		command: commandSpec.command,
 		args: [...commandSpec.args, '-lsp', ...settings.serverExtraArgs],
@@ -360,27 +271,12 @@ async function startLanguageClient(): Promise<void> {
 		serverOptions,
 		clientOptions,
 	);
-	client.onNotification('siglusSS/scanStatus', (params: ScanStatusParams) => {
-		if (params.phase === 'begin') {
-			beginScanProgress(params);
-			return;
-		}
-		if (params.phase === 'report') {
-			reportScanProgress(params);
-			return;
-		}
-		endScanProgress(params);
-	});
 	await client.start();
 }
 
 async function stopLanguageClient(): Promise<void> {
 	const current = client;
 	client = undefined;
-	for (const entry of siglusScanJobs.values()) {
-		entry.resolve();
-	}
-	siglusScanJobs.clear();
 	if (current) {
 		await current.stop();
 	}
@@ -395,7 +291,14 @@ function toErrorMessage(error: unknown): string {
 
 function isMissingCommandError(error: unknown): boolean {
 	const message = toErrorMessage(error);
-	return /\bENOENT\b/i.test(message) || /\bnot recognized\b/i.test(message);
+	return (
+		/\bENOENT\b/i.test(message) ||
+		/\bnot recognized\b/i.test(message) ||
+		/\bcommand not found\b/i.test(message) ||
+		/\bnot found\b/i.test(message) ||
+		/\bno such file or directory\b/i.test(message) ||
+		/\bfailed to spawn\b/i.test(message)
+	);
 }
 
 function isMissingLanguageClientModuleError(error: unknown): boolean {
@@ -407,6 +310,65 @@ function configurationTarget(): vscode.ConfigurationTarget {
 	return primaryWorkspaceFolder()
 		? vscode.ConfigurationTarget.Workspace
 		: vscode.ConfigurationTarget.Global;
+}
+
+async function ensureLanguageServerCommandAvailable(commandSpec: CommandSpec): Promise<void> {
+	const args = [...commandSpec.args, '--version'];
+	const label = [commandSpec.command, ...args].join(' ');
+	await new Promise<void>((resolve, reject) => {
+		let output = '';
+		let finished = false;
+		const child = spawn(commandSpec.command, args, {
+			cwd: commandSpec.cwd,
+			windowsHide: true,
+		});
+		const timer = setTimeout(() => {
+			if (finished) {
+				return;
+			}
+			finished = true;
+			child.kill();
+			reject(new Error(`Timed out while checking ${label}.`));
+		}, 10000);
+		const finish = (callback: () => void) => {
+			if (finished) {
+				return;
+			}
+			finished = true;
+			clearTimeout(timer);
+			callback();
+		};
+		child.stdout.on('data', (chunk: Buffer) => {
+			output += chunk.toString('utf8');
+		});
+		child.stderr.on('data', (chunk: Buffer) => {
+			output += chunk.toString('utf8');
+		});
+		child.on('error', (error: NodeJS.ErrnoException) => {
+			finish(() => {
+				if (error.code === 'ENOENT') {
+					reject(new MissingSiglusSsuError(`${label} was not found.`));
+					return;
+				}
+				reject(error);
+			});
+		});
+		child.on('close', (code) => {
+			finish(() => {
+				if (code === 0) {
+					resolve();
+					return;
+				}
+				const detail = output.trim();
+				const message = `${label} exited with code ${code ?? 'unknown'}${detail ? `: ${detail}` : '.'}`;
+				if (isMissingCommandError(message)) {
+					reject(new MissingSiglusSsuError(message));
+					return;
+				}
+				reject(new Error(message));
+			});
+		});
+	});
 }
 
 async function promptForSiglusSsuPath(): Promise<void> {
@@ -439,23 +401,23 @@ async function handleLanguageServerStartError(error: unknown): Promise<void> {
 		);
 		return;
 	}
-	if (!isMissingCommandError(error)) {
+	if (!(error instanceof MissingSiglusSsuError) && !isMissingCommandError(error)) {
 		void vscode.window.showErrorMessage(
 			`Failed to start SiglusSS language server. Check siglusSS.siglusSsuPath. ${toErrorMessage(error)}`,
 		);
 		return;
 	}
 	const action = await vscode.window.showErrorMessage(
-		'SiglusSS language server could not start because the configured command was not found.',
+		'siglus-ssu is not installed or is not available from the configured path.',
+		'Install siglus-ssu',
 		'Set Path',
-		'Install With Pip',
 	);
-	if (action === 'Set Path') {
-		await promptForSiglusSsuPath();
+	if (action === 'Install siglus-ssu') {
+		openSiglusSsuInstallTerminal();
 		return;
 	}
-	if (action === 'Install With Pip') {
-		openSiglusSsuInstallTerminal();
+	if (action === 'Set Path') {
+		await promptForSiglusSsuPath();
 	}
 }
 
