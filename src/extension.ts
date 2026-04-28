@@ -6,13 +6,31 @@ import * as vscode from 'vscode';
 import {
 	type LanguageClient,
 	type LanguageClientOptions,
+	type ProgressToken,
 	type ServerOptions,
+	WorkDoneProgress,
+	type WorkDoneProgressBegin,
+	type WorkDoneProgressEnd,
+	type WorkDoneProgressReport,
 } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
 let serverOutput: vscode.OutputChannel | undefined;
+let installSiglusSsuJob: Promise<void> | undefined;
+let installSiglusSsuScheduled = false;
+let isInstallingSiglusSsu = false;
 const siglusEncodingJobs = new Map<string, Promise<void>>();
 const SIGLUS_ENCODINGS = ['shiftjis', 'utf8bom', 'utf8'] as const;
+const LSP_PROGRESS_REQUEST_METHODS = new Set([
+	'textDocument/diagnostic',
+	'textDocument/definition',
+	'textDocument/references',
+	'textDocument/rename',
+	'textDocument/semanticTokens/full',
+]);
+let lspProgressTokenCounter = 0;
+const lspProgressStates = new Map<string, LspNotificationProgressState>();
+const lspProgressDisposables = new Map<string, vscode.Disposable>();
 
 type ExtensionSettings = {
 	configuredPath: string;
@@ -23,6 +41,27 @@ type CommandSpec = {
 	command: string;
 	args: string[];
 	cwd?: string;
+};
+
+type RunProcessOptions = {
+	cwd?: string;
+	outputChannel?: vscode.OutputChannel;
+	token?: vscode.CancellationToken;
+};
+
+type InstallProgressReporter = (message: string, increment?: number) => void;
+
+type LspWorkDoneProgress =
+	| WorkDoneProgressBegin
+	| WorkDoneProgressReport
+	| WorkDoneProgressEnd;
+
+type LspNotificationProgressState = {
+	closed: boolean;
+	progress?: vscode.Progress<{ increment?: number; message?: string }>;
+	reportedPercentage: number;
+	pending: LspWorkDoneProgress[];
+	resolve?: () => void;
 };
 
 type DecodedCandidate = {
@@ -261,6 +300,21 @@ async function startLanguageClient(): Promise<void> {
 	const clientOptions: LanguageClientOptions = {
 		documentSelector: [{ scheme: 'file', language: 'siglusss' }],
 		outputChannel,
+		middleware: {
+			async sendRequest(type, params, token, next) {
+				const method = requestMethodName(type);
+				if (!canAttachWorkDoneToken(method, params)) {
+					return next(type, params, token);
+				}
+				const workDoneToken = nextLspProgressToken(method);
+				registerLspNotificationProgress(workDoneToken);
+				try {
+					return await next(type, { ...params, workDoneToken }, token);
+				} finally {
+					setTimeout(() => finishLspNotificationProgress(workDoneToken), 1000);
+				}
+			},
+		},
 		synchronize: {
 			configurationSection: 'siglusSS',
 		},
@@ -277,6 +331,7 @@ async function startLanguageClient(): Promise<void> {
 async function stopLanguageClient(): Promise<void> {
 	const current = client;
 	client = undefined;
+	clearLspNotificationProgress();
 	if (current) {
 		await current.stop();
 	}
@@ -306,10 +361,314 @@ function isMissingLanguageClientModuleError(error: unknown): boolean {
 	return /Cannot find module ['"]vscode-languageclient\/node['"]/i.test(message);
 }
 
+function isCancellationError(error: unknown): boolean {
+	return /\bcancelled\b/i.test(toErrorMessage(error));
+}
+
 function configurationTarget(): vscode.ConfigurationTarget {
 	return primaryWorkspaceFolder()
 		? vscode.ConfigurationTarget.Workspace
 		: vscode.ConfigurationTarget.Global;
+}
+
+function commandLabel(command: string, args: string[]): string {
+	return [command, ...args].join(' ');
+}
+
+function delay(milliseconds: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function lspProgressTokenKey(token: ProgressToken): string {
+	return typeof token === 'string' ? `s:${token}` : `n:${token}`;
+}
+
+function nextLspProgressToken(method: string): ProgressToken {
+	lspProgressTokenCounter += 1;
+	return `siglusSS:${method}:${Date.now()}:${lspProgressTokenCounter}`;
+}
+
+function requestMethodName(type: unknown): string {
+	if (typeof type === 'string') {
+		return type;
+	}
+	if (type && typeof type === 'object' && 'method' in type) {
+		const method = (type as { method?: unknown }).method;
+		return typeof method === 'string' ? method : '';
+	}
+	return '';
+}
+
+function canAttachWorkDoneToken(method: string, params: unknown): params is Record<string, unknown> {
+	return (
+		LSP_PROGRESS_REQUEST_METHODS.has(method) &&
+		params !== null &&
+		typeof params === 'object' &&
+		!Array.isArray(params) &&
+		!Object.prototype.hasOwnProperty.call(params, 'workDoneToken')
+	);
+}
+
+function createLspNotificationProgress(token: ProgressToken, params: WorkDoneProgressBegin): void {
+	const key = lspProgressTokenKey(token);
+	const existing = lspProgressStates.get(key);
+	if (existing) {
+		finishLspNotificationProgress(token);
+	}
+	const state: LspNotificationProgressState = {
+		closed: false,
+		reportedPercentage: 0,
+		pending: [params],
+	};
+	lspProgressStates.set(key, state);
+	void Promise.resolve(
+		vscode.window.withProgress(
+			{
+				location: vscode.ProgressLocation.Notification,
+				title: params.title || 'SiglusSS',
+				cancellable: false,
+			},
+			async (progress) => {
+				state.progress = progress;
+				for (const item of state.pending.splice(0)) {
+					reportLspNotificationProgress(state, item);
+				}
+				if (state.closed) {
+					return;
+				}
+				await new Promise<void>((resolve) => {
+					state.resolve = resolve;
+					if (state.closed) {
+						resolve();
+					}
+				});
+			},
+		),
+	)
+		.finally(() => {
+			lspProgressStates.delete(key);
+		});
+}
+
+function reportLspNotificationProgress(
+	state: LspNotificationProgressState,
+	params: LspWorkDoneProgress,
+): void {
+	if (!state.progress) {
+		state.pending.push(params);
+		return;
+	}
+	if (params.kind === 'end') {
+		if (params.message) {
+			state.progress.report({ message: params.message });
+		}
+		return;
+	}
+	const message = params.message;
+	if (typeof params.percentage === 'number') {
+		const percentage = Math.max(0, Math.min(100, params.percentage));
+		const increment = Math.max(0, percentage - state.reportedPercentage);
+		state.reportedPercentage += increment;
+		state.progress.report({ message, increment });
+		return;
+	}
+	state.progress.report({ message });
+}
+
+function handleLspNotificationProgress(
+	token: ProgressToken,
+	params: LspWorkDoneProgress,
+): void {
+	if (params.kind === 'begin') {
+		createLspNotificationProgress(token, params);
+		return;
+	}
+	const state = lspProgressStates.get(lspProgressTokenKey(token));
+	if (!state) {
+		return;
+	}
+	reportLspNotificationProgress(state, params);
+	if (params.kind === 'end') {
+		finishLspNotificationProgress(token);
+	}
+}
+
+function finishLspNotificationProgress(token: ProgressToken): void {
+	const key = lspProgressTokenKey(token);
+	const state = lspProgressStates.get(key);
+	if (state && !state.closed) {
+		state.closed = true;
+		state.resolve?.();
+	}
+	lspProgressDisposables.get(key)?.dispose();
+	lspProgressDisposables.delete(key);
+}
+
+function registerLspNotificationProgress(token: ProgressToken): void {
+	if (!client) {
+		return;
+	}
+	const key = lspProgressTokenKey(token);
+	lspProgressDisposables.get(key)?.dispose();
+	lspProgressDisposables.set(
+		key,
+		client.onProgress(WorkDoneProgress.type, token, (params) => {
+			handleLspNotificationProgress(token, params);
+		}),
+	);
+}
+
+function clearLspNotificationProgress(): void {
+	for (const key of [...lspProgressDisposables.keys()]) {
+		const token = key.slice(2);
+		finishLspNotificationProgress(key.startsWith('n:') ? Number(token) : token);
+	}
+}
+
+async function runProcess(
+	command: string,
+	args: string[],
+	options: RunProcessOptions = {},
+): Promise<string> {
+	const outputChannel = options.outputChannel ?? getServerOutputChannel();
+	const label = commandLabel(command, args);
+	outputChannel.appendLine('');
+	outputChannel.appendLine(`> ${label}`);
+	return new Promise<string>((resolve, reject) => {
+		let output = '';
+		let finished = false;
+		let cancellationDisposable: vscode.Disposable | undefined;
+		const child = spawn(command, args, {
+			cwd: options.cwd,
+			windowsHide: true,
+		});
+		const finish = (callback: () => void) => {
+			if (finished) {
+				return;
+			}
+			finished = true;
+			cancellationDisposable?.dispose();
+			callback();
+		};
+		const cancel = () => {
+			finish(() => {
+				child.kill();
+				reject(new Error(`${label} was cancelled.`));
+			});
+		};
+		if (options.token?.isCancellationRequested) {
+			cancel();
+			return;
+		}
+		cancellationDisposable = options.token?.onCancellationRequested(cancel);
+		child.stdout.on('data', (chunk: Buffer) => {
+			const text = chunk.toString('utf8');
+			output += text;
+			outputChannel.append(text);
+		});
+		child.stderr.on('data', (chunk: Buffer) => {
+			const text = chunk.toString('utf8');
+			output += text;
+			outputChannel.append(text);
+		});
+		child.on('error', (error) => {
+			finish(() => reject(error));
+		});
+		child.on('close', (code) => {
+			finish(() => {
+				if (code === 0) {
+					resolve(output);
+					return;
+				}
+				const detail = output.trim();
+				reject(
+					new Error(
+						`${label} exited with code ${code ?? 'unknown'}${detail ? `: ${detail}` : '.'}`,
+					),
+				);
+			});
+		});
+	});
+}
+
+async function installSiglusSsuPackage(
+	reportProgress: InstallProgressReporter,
+	token: vscode.CancellationToken,
+	outputChannel: vscode.OutputChannel,
+): Promise<string> {
+	const args = ['-m', 'pip', 'install', '-U', 'siglus-ssu'];
+	reportProgress('Installing package...', 5);
+	try {
+		await runProcess('python', args, { outputChannel, token });
+		return 'python';
+	} catch (error) {
+		if (!isMissingCommandError(error)) {
+			throw error;
+		}
+		reportProgress('python was not found, trying python3...');
+		await runProcess('python3', args, { outputChannel, token });
+		return 'python3';
+	}
+}
+
+async function resolvePythonConsoleScript(
+	pythonCommand: string,
+	scriptName: string,
+	token: vscode.CancellationToken,
+	outputChannel: vscode.OutputChannel,
+): Promise<string | undefined> {
+	const code = [
+		'import os, sys, sysconfig',
+		`name = ${JSON.stringify(scriptName)}`,
+		'if sys.platform == "win32":',
+		'    name += ".exe"',
+		'print(os.path.join(sysconfig.get_path("scripts"), name))',
+	].join('\n');
+	const output = await runProcess(pythonCommand, ['-c', code], { outputChannel, token });
+	const scriptPath = output.trim().split(/\r?\n/).pop()?.trim();
+	return scriptPath || undefined;
+}
+
+async function runSiglusSsuInit(
+	pythonCommand: string,
+	reportProgress: InstallProgressReporter,
+	token: vscode.CancellationToken,
+	outputChannel: vscode.OutputChannel,
+): Promise<void> {
+	reportProgress('Locating siglus-ssu...', 55);
+	const installedScriptPath = await resolvePythonConsoleScript(
+		pythonCommand,
+		'siglus-ssu',
+		token,
+		outputChannel,
+	);
+	const initCandidates: CommandSpec[] = [];
+	if (installedScriptPath && existsSync(installedScriptPath)) {
+		initCandidates.push({ command: installedScriptPath, args: [] });
+	}
+	initCandidates.push({ command: 'siglus-ssu', args: [] });
+	reportProgress('Running init --force...', 10);
+	let lastError: unknown;
+	for (const candidate of initCandidates) {
+		try {
+			await runProcess(candidate.command, [...candidate.args, 'init', '--force'], {
+				outputChannel,
+				token,
+			});
+			if (candidate.command !== 'siglus-ssu' && getSettings().configuredPath === 'siglus-ssu') {
+				await vscode.workspace
+					.getConfiguration('siglusSS')
+					.update('siglusSsuPath', candidate.command, configurationTarget());
+			}
+			return;
+		} catch (error) {
+			lastError = error;
+			if (!isMissingCommandError(error)) {
+				throw error;
+			}
+		}
+	}
+	throw lastError instanceof Error ? lastError : new Error('Failed to run siglus-ssu init --force.');
 }
 
 async function ensureLanguageServerCommandAvailable(commandSpec: CommandSpec): Promise<void> {
@@ -387,21 +746,98 @@ async function promptForSiglusSsuPath(): Promise<void> {
 		.update('siglusSsuPath', value.trim(), configurationTarget());
 }
 
-function openSiglusSsuInstallTerminal(): void {
-	const terminal = vscode.window.createTerminal('SiglusSS Setup');
-	terminal.show(true);
-	terminal.sendText('python -m pip install -U siglus-ssu', true);
+async function installSiglusSsuWithProgress(): Promise<void> {
+	if (installSiglusSsuJob) {
+		return installSiglusSsuJob;
+	}
+	const outputChannel = getServerOutputChannel();
+	const statusBarItem = vscode.window.createStatusBarItem(
+		'siglusSS.setup',
+		vscode.StatusBarAlignment.Left,
+		100,
+	);
+	statusBarItem.name = 'SiglusSS Setup';
+	statusBarItem.tooltip = 'Setting up siglus-ssu';
+	installSiglusSsuJob = (async () => {
+		try {
+			isInstallingSiglusSsu = true;
+			statusBarItem.text = '$(sync~spin) Setting up siglus-ssu';
+			statusBarItem.show();
+			await vscode.window.withProgress(
+				{
+					location: vscode.ProgressLocation.Notification,
+					title: 'Setting up siglus-ssu',
+					cancellable: true,
+				},
+				async (progress, token) => {
+					const reportProgress: InstallProgressReporter = (message, increment) => {
+						statusBarItem.text = `$(sync~spin) ${message}`;
+						statusBarItem.tooltip = `SiglusSS setup: ${message}`;
+						progress.report({ message, increment });
+					};
+					reportProgress('Starting setup...', 0);
+					await delay(250);
+					const pythonCommand = await installSiglusSsuPackage(
+						reportProgress,
+						token,
+						outputChannel,
+					);
+					if (token.isCancellationRequested) {
+						throw new Error('SiglusSS setup was cancelled.');
+					}
+					await runSiglusSsuInit(pythonCommand, reportProgress, token, outputChannel);
+					if (token.isCancellationRequested) {
+						throw new Error('SiglusSS setup was cancelled.');
+					}
+					reportProgress('Restarting language server...', 25);
+					await stopLanguageClient();
+					await startLanguageClient();
+					reportProgress('Ready.', 5);
+				},
+			);
+			void vscode.window.showInformationMessage(
+				'siglus-ssu installed, initialized, and the language server was restarted.',
+			);
+		} catch (error) {
+			if (isCancellationError(error)) {
+				void vscode.window.showWarningMessage('SiglusSS setup cancelled.');
+				return;
+			}
+			outputChannel.show(true);
+			void vscode.window.showErrorMessage(
+				`Failed to install and initialize siglus-ssu. ${toErrorMessage(error)}`,
+			);
+		} finally {
+			isInstallingSiglusSsu = false;
+			statusBarItem.dispose();
+		}
+	})().finally(() => {
+		installSiglusSsuJob = undefined;
+	});
+	return installSiglusSsuJob;
+}
+
+function scheduleSiglusSsuInstallWithProgress(): void {
+	if (installSiglusSsuJob || installSiglusSsuScheduled) {
+		return;
+	}
+	installSiglusSsuScheduled = true;
+	setTimeout(() => {
+		installSiglusSsuScheduled = false;
+		void installSiglusSsuWithProgress();
+	}, 0);
 }
 
 async function handleLanguageServerStartError(error: unknown): Promise<void> {
-	serverOutput?.show(true);
 	if (isMissingLanguageClientModuleError(error)) {
+		serverOutput?.show(true);
 		void vscode.window.showErrorMessage(
 			'SiglusSS extension package is missing the vscode-languageclient runtime. Reinstall or update the VSIX.',
 		);
 		return;
 	}
 	if (!(error instanceof MissingSiglusSsuError) && !isMissingCommandError(error)) {
+		serverOutput?.show(true);
 		void vscode.window.showErrorMessage(
 			`Failed to start SiglusSS language server. Check siglusSS.siglusSsuPath. ${toErrorMessage(error)}`,
 		);
@@ -413,7 +849,7 @@ async function handleLanguageServerStartError(error: unknown): Promise<void> {
 		'Set Path',
 	);
 	if (action === 'Install siglus-ssu') {
-		openSiglusSsuInstallTerminal();
+		scheduleSiglusSsuInstallWithProgress();
 		return;
 	}
 	if (action === 'Set Path') {
@@ -443,6 +879,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeConfiguration((event) => {
+			if (
+				isInstallingSiglusSsu &&
+				event.affectsConfiguration('siglusSS.siglusSsuPath')
+			) {
+				return;
+			}
 			if (
 				event.affectsConfiguration('siglusSS.siglusSsuPath') ||
 				event.affectsConfiguration('siglusSS.serverExtraArgs')
