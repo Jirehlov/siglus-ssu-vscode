@@ -1,6 +1,6 @@
 # SiglusSS Support
 
-VS Code extension for SiglusSceneScript powered by `siglus-ssu`.
+VS Code extension for SiglusSceneScript powered by `siglus-ssu` (https://github.com/Jirehlov/SiglusSceneScriptUtility).
 
 ## Features
 
