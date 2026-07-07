@@ -2,7 +2,7 @@
   "name": "siglus-ssu-vscode",
   "displayName": "SiglusSS Support",
   "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
-  "version": "0.0.6",
+  "version": "0.0.7",
   "publisher": "Jirehlov",
   "license": "MIT",
   "repository": {
@@ -184,6 +184,11 @@
             "type": "string"
           },
           "markdownDescription": "Extra arguments passed to `siglus-ssu -lsp`."
+        },
+        "siglusSS.autoUpdateSiglusSsu": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Automatically check PyPI for `siglus-ssu` updates after the language server starts. When an update is available, the extension prompts before installing it."
         }
       }
     }

@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
+import * as https from 'node:https';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -19,11 +20,15 @@ let serverOutput: vscode.OutputChannel | undefined;
 let installSiglusSsuJob: Promise<void> | undefined;
 let installSiglusSsuScheduled = false;
 let isInstallingSiglusSsu = false;
+let siglusSsuUpdateCheckJob: Promise<void> | undefined;
+let siglusSsuUpdateCheckScheduled = false;
 const siglusEncodingJobs = new Map<string, Promise<void>>();
 const SIGLUS_ENCODINGS = ['shiftjis', 'utf8bom', 'utf8'] as const;
+const SKIPPED_SIGLUS_SSU_VERSION_KEY = 'siglusSS.skippedSiglusSsuVersion';
 const LSP_PROGRESS_REQUEST_METHODS = new Set([
 	'textDocument/diagnostic',
 	'textDocument/definition',
+	'textDocument/documentSymbol',
 	'textDocument/references',
 	'textDocument/rename',
 	'textDocument/semanticTokens/full',
@@ -31,10 +36,12 @@ const LSP_PROGRESS_REQUEST_METHODS = new Set([
 let lspProgressTokenCounter = 0;
 const lspProgressStates = new Map<string, LspNotificationProgressState>();
 const lspProgressDisposables = new Map<string, vscode.Disposable>();
+let languageServerStatusItem: vscode.StatusBarItem | undefined;
 
 type ExtensionSettings = {
 	configuredPath: string;
 	serverExtraArgs: string[];
+	autoUpdateSiglusSsu: boolean;
 };
 
 type CommandSpec = {
@@ -84,11 +91,36 @@ function getServerOutputChannel(): vscode.OutputChannel {
 	return serverOutput;
 }
 
+function getLanguageServerStatusItem(): vscode.StatusBarItem {
+	if (!languageServerStatusItem) {
+		languageServerStatusItem = vscode.window.createStatusBarItem(
+			'siglusSS.languageServer',
+			vscode.StatusBarAlignment.Left,
+			90,
+		);
+		languageServerStatusItem.name = 'SiglusSS Language Server';
+		languageServerStatusItem.command = 'siglusSS.restartLanguageServer';
+	}
+	return languageServerStatusItem;
+}
+
+function setLanguageServerStatus(text: string, tooltip: string): void {
+	const item = getLanguageServerStatusItem();
+	item.text = text;
+	item.tooltip = tooltip;
+	item.show();
+}
+
+function hideLanguageServerStatus(): void {
+	languageServerStatusItem?.hide();
+}
+
 function getSettings(): ExtensionSettings {
 	const config = vscode.workspace.getConfiguration('siglusSS');
 	return {
 		configuredPath: (config.get<string>('siglusSsuPath') || 'siglus-ssu').trim() || 'siglus-ssu',
 		serverExtraArgs: normalizeStringArray(config.get<unknown>('serverExtraArgs')),
+		autoUpdateSiglusSsu: config.get<boolean>('autoUpdateSiglusSsu') !== false,
 	};
 }
 
@@ -290,7 +322,15 @@ async function startLanguageClient(): Promise<void> {
 	const { LanguageClient } = await import('vscode-languageclient/node');
 	const outputChannel = getServerOutputChannel();
 	const settings = getSettings();
+	setLanguageServerStatus(
+		'$(sync~spin) SiglusSS LSP',
+		'Starting SiglusSS language server...',
+	);
 	const commandSpec = resolveCommandSpec(settings.configuredPath);
+	setLanguageServerStatus(
+		'$(sync~spin) SiglusSS LSP',
+		`Checking ${commandLabel(commandSpec.command, [...commandSpec.args, '-lsp'])}`,
+	);
 	await ensureLanguageServerCommandAvailable(commandSpec);
 	const serverOptions: ServerOptions = {
 		command: commandSpec.command,
@@ -325,16 +365,30 @@ async function startLanguageClient(): Promise<void> {
 		serverOptions,
 		clientOptions,
 	);
+	setLanguageServerStatus(
+		'$(sync~spin) SiglusSS LSP',
+		'Connecting to SiglusSS language server...',
+	);
 	await client.start();
+	setLanguageServerStatus(
+		'$(check) SiglusSS LSP',
+		'SiglusSS language server is running. Click to restart.',
+	);
+	setTimeout(() => hideLanguageServerStatus(), 4000);
 }
 
 async function stopLanguageClient(): Promise<void> {
 	const current = client;
 	client = undefined;
 	clearLspNotificationProgress();
+	setLanguageServerStatus(
+		'$(sync~spin) SiglusSS LSP',
+		'Stopping SiglusSS language server...',
+	);
 	if (current) {
 		await current.stop();
 	}
+	hideLanguageServerStatus();
 }
 
 function toErrorMessage(error: unknown): string {
@@ -730,6 +784,156 @@ async function ensureLanguageServerCommandAvailable(commandSpec: CommandSpec): P
 	});
 }
 
+function parseSiglusSsuVersion(output: string): string | undefined {
+	const match = output.match(
+		/\bsiglus-ssu(?:\.exe)?\s+([0-9]+(?:\.[0-9]+){1,3}(?:[-+][^\s]+)?)/i,
+	);
+	return match?.[1];
+}
+
+function versionParts(version: string): number[] {
+	return version
+		.split(/[.+-]/)
+		.slice(0, 4)
+		.map((part) => {
+			const match = part.match(/^\d+/);
+			return match ? Number(match[0]) : 0;
+		});
+}
+
+function compareVersions(left: string, right: string): number {
+	const leftParts = versionParts(left);
+	const rightParts = versionParts(right);
+	const count = Math.max(leftParts.length, rightParts.length);
+	for (let index = 0; index < count; index += 1) {
+		const diff = (leftParts[index] ?? 0) - (rightParts[index] ?? 0);
+		if (diff !== 0) {
+			return diff;
+		}
+	}
+	return 0;
+}
+
+function isSiglusSsuAutoUpdateTarget(
+	settings: ExtensionSettings,
+	commandSpec: CommandSpec,
+): boolean {
+	if (!settings.autoUpdateSiglusSsu || commandSpec.cwd) {
+		return false;
+	}
+	const configuredPath = stripWrappingQuotes(settings.configuredPath);
+	if (!configuredPath || configuredPath === 'siglus-ssu') {
+		return true;
+	}
+	return /^siglus-ssu(?:\.exe)?$/i.test(path.basename(commandSpec.command));
+}
+
+function fetchText(url: string): Promise<string> {
+	return new Promise((resolve, reject) => {
+		const request = https.get(
+			url,
+			{
+				headers: {
+					'User-Agent': 'siglus-ssu-vscode',
+				},
+			},
+			(response) => {
+				if ((response.statusCode ?? 0) < 200 || (response.statusCode ?? 0) >= 300) {
+					response.resume();
+					reject(
+						new Error(`HTTP ${response.statusCode ?? 'unknown'} while requesting ${url}`),
+					);
+					return;
+				}
+				let data = '';
+				response.setEncoding('utf8');
+				response.on('data', (chunk: string) => {
+					data += chunk;
+				});
+				response.on('end', () => resolve(data));
+			},
+		);
+		request.setTimeout(10000, () => {
+			request.destroy(new Error(`Timed out while requesting ${url}`));
+		});
+		request.on('error', reject);
+	});
+}
+
+async function fetchLatestSiglusSsuVersion(): Promise<string | undefined> {
+	const text = await fetchText('https://pypi.org/pypi/siglus-ssu/json');
+	const data = JSON.parse(text) as { info?: { version?: unknown } };
+	return typeof data.info?.version === 'string' ? data.info.version : undefined;
+}
+
+async function checkSiglusSsuUpdateWithProgress(context: vscode.ExtensionContext): Promise<void> {
+	if (siglusSsuUpdateCheckJob) {
+		return siglusSsuUpdateCheckJob;
+	}
+	siglusSsuUpdateCheckJob = (async () => {
+		const settings = getSettings();
+		const commandSpec = resolveCommandSpec(settings.configuredPath);
+		if (!isSiglusSsuAutoUpdateTarget(settings, commandSpec)) {
+			return;
+		}
+		try {
+			setLanguageServerStatus(
+				'$(sync~spin) SiglusSS update',
+				'Checking for siglus-ssu updates...',
+			);
+			const versionOutput = await runProcess(
+				commandSpec.command,
+				[...commandSpec.args, '--version'],
+				{
+					cwd: commandSpec.cwd,
+					outputChannel: getServerOutputChannel(),
+				},
+			);
+			const currentVersion = parseSiglusSsuVersion(versionOutput);
+			if (!currentVersion) {
+				return;
+			}
+			const latestVersion = await fetchLatestSiglusSsuVersion();
+			if (!latestVersion || compareVersions(latestVersion, currentVersion) <= 0) {
+				return;
+			}
+			if (context.globalState.get<string>(SKIPPED_SIGLUS_SSU_VERSION_KEY) === latestVersion) {
+				return;
+			}
+			const action = await vscode.window.showInformationMessage(
+				`siglus-ssu ${latestVersion} is available. Current version: ${currentVersion}.`,
+				'Update siglus-ssu',
+				'Skip this version',
+			);
+			if (action === 'Update siglus-ssu') {
+				await installSiglusSsuWithProgress();
+			} else if (action === 'Skip this version') {
+				await context.globalState.update(SKIPPED_SIGLUS_SSU_VERSION_KEY, latestVersion);
+			}
+		} catch (error) {
+			getServerOutputChannel().appendLine(
+				`siglus-ssu update check failed: ${toErrorMessage(error)}`,
+			);
+		} finally {
+			hideLanguageServerStatus();
+		}
+	})().finally(() => {
+		siglusSsuUpdateCheckJob = undefined;
+	});
+	return siglusSsuUpdateCheckJob;
+}
+
+function scheduleSiglusSsuUpdateCheck(context: vscode.ExtensionContext): void {
+	if (siglusSsuUpdateCheckJob || siglusSsuUpdateCheckScheduled) {
+		return;
+	}
+	siglusSsuUpdateCheckScheduled = true;
+	setTimeout(() => {
+		siglusSsuUpdateCheckScheduled = false;
+		void checkSiglusSsuUpdateWithProgress(context);
+	}, 5000);
+}
+
 async function promptForSiglusSsuPath(): Promise<void> {
 	const current = getSettings().configuredPath;
 	const value = await vscode.window.showInputBox({
@@ -829,6 +1033,11 @@ function scheduleSiglusSsuInstallWithProgress(): void {
 }
 
 async function handleLanguageServerStartError(error: unknown): Promise<void> {
+	setLanguageServerStatus(
+		'$(error) SiglusSS LSP',
+		`SiglusSS language server failed to start: ${toErrorMessage(error)}`,
+	);
+	setTimeout(() => hideLanguageServerStatus(), 8000);
 	if (isMissingLanguageClientModuleError(error)) {
 		serverOutput?.show(true);
 		void vscode.window.showErrorMessage(
@@ -869,6 +1078,7 @@ async function restartLanguageClient(): Promise<void> {
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	context.subscriptions.push(getServerOutputChannel());
+	context.subscriptions.push(getLanguageServerStatusItem());
 	context.subscriptions.push(
 		vscode.workspace.onDidOpenTextDocument((document) => {
 			void ensureSiglusEncoding(document);
@@ -898,6 +1108,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	}
 	try {
 		await startLanguageClient();
+		scheduleSiglusSsuUpdateCheck(context);
 	} catch (error) {
 		await handleLanguageServerStartError(error);
 	}
