@@ -16,7 +16,7 @@ import {
 } from 'vscode-languageclient/node';
 
 let client: LanguageClient | undefined;
-let serverOutput: vscode.OutputChannel | undefined;
+let serverOutput: vscode.LogOutputChannel | undefined;
 let installSiglusSsuJob: Promise<void> | undefined;
 let installSiglusSsuScheduled = false;
 let isInstallingSiglusSsu = false;
@@ -84,9 +84,11 @@ class MissingSiglusSsuError extends Error {
 	}
 }
 
-function getServerOutputChannel(): vscode.OutputChannel {
+function getServerOutputChannel(): vscode.LogOutputChannel {
 	if (!serverOutput) {
-		serverOutput = vscode.window.createOutputChannel('SiglusSS Language Server');
+		serverOutput = vscode.window.createOutputChannel('SiglusSS Language Server', {
+			log: true,
+		});
 	}
 	return serverOutput;
 }

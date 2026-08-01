@@ -2,7 +2,7 @@
   "name": "siglus-ssu-vscode",
   "displayName": "SiglusSS Support",
   "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
-  "version": "0.0.7",
+  "version": "0.0.8",
   "publisher": "Jirehlov",
   "license": "MIT",
   "repository": {
@@ -10,7 +10,7 @@
     "url": "https://github.com/Jirehlov/siglus-ssu-vscode.git"
   },
   "engines": {
-    "vscode": "^1.90.0"
+    "vscode": "^1.100.0"
   },
   "categories": [
     "Programming Languages",
@@ -203,7 +203,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
-    "@types/vscode": "^1.90.0",
+    "@types/vscode": "1.100.0",
     "typescript": "^5.7.3"
   }
 }
