@@ -2,7 +2,7 @@
   "name": "siglus-ssu-vscode",
   "displayName": "SiglusSS Support",
   "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "publisher": "Jirehlov",
   "license": "MIT",
   "repository": {
@@ -108,6 +108,7 @@
     "configurationDefaults": {
       "[siglusss]": {
         "editor.semanticHighlighting.enabled": true,
+        "editor.defaultColorDecorators": "never",
         "files.encoding": "shiftjis",
         "files.autoGuessEncoding": true
       },
