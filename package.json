@@ -2,7 +2,7 @@
   "name": "siglus-ssu-vscode",
   "displayName": "SiglusSS Support",
   "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
-  "version": "0.0.9",
+  "version": "0.0.10",
   "publisher": "Jirehlov",
   "license": "MIT",
   "repository": {
@@ -18,7 +18,8 @@
   ],
   "activationEvents": [
     "onLanguage:siglusss",
-    "onCommand:siglusSS.restartLanguageServer"
+    "onCommand:siglusSS.restartLanguageServer",
+    "onCommand:siglusSS.selectConstProfile"
   ],
   "main": "./out/extension.js",
   "files": [
@@ -103,6 +104,10 @@
       {
         "command": "siglusSS.restartLanguageServer",
         "title": "SiglusSS: Restart Language Server"
+      },
+      {
+        "command": "siglusSS.selectConstProfile",
+        "title": "SiglusSS: Select Const Profile"
       }
     ],
     "configurationDefaults": {
@@ -184,12 +189,22 @@
           "items": {
             "type": "string"
           },
-          "markdownDescription": "Extra arguments passed to `siglus-ssu -lsp`."
+          "markdownDescription": "Extra arguments passed to `siglus-ssu -lsp`. Prefer `siglusSS.constProfile` for profile selection."
         },
         "siglusSS.autoUpdateSiglusSsu": {
           "type": "boolean",
           "default": true,
           "markdownDescription": "Automatically check PyPI for `siglus-ssu` updates after the language server starts. When an update is available, the extension prompts before installing it."
+        },
+        "siglusSS.constProfile": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "default": null,
+          "minimum": 0,
+          "scope": "window",
+          "markdownDescription": "Const profile number for the language server. Click **SiglusSS: Profile** in the status bar or run **SiglusSS: Select Const Profile** to query the available numbers from your configured `siglus-ssu`. Changes restart the server. A number overrides `--const-profile` in `siglusSS.serverExtraArgs`. Leave unset or use `null` to honor that legacy argument, or otherwise let the server choose its default."
         }
       }
     }

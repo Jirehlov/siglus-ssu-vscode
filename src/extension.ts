@@ -4,6 +4,7 @@ import * as https from 'node:https';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
+import { parseConstProfileCatalog, resolveConstProfile, type ConstProfileCatalog } from './constProfiles';
 import {
 	type LanguageClient,
 	type LanguageClientOptions,
@@ -37,10 +38,21 @@ let lspProgressTokenCounter = 0;
 const lspProgressStates = new Map<string, LspNotificationProgressState>();
 const lspProgressDisposables = new Map<string, vscode.Disposable>();
 let languageServerStatusItem: vscode.StatusBarItem | undefined;
+let constProfileStatusItem: vscode.StatusBarItem | undefined;
+let languageClientOperation: Promise<void> = Promise.resolve();
+let languageServerGeneration = 0;
+let isDeactivating = false;
+let languageServerState: 'stopped' | 'starting' | 'running' | 'error' = 'stopped';
+let runningConstProfile: number | undefined;
+let runningCommandKey: string | undefined;
+let constProfileCatalog: { commandKey: string; value: ConstProfileCatalog } | undefined;
+let constProfilePickerJob: Promise<void> | undefined;
+let loadingConstProfiles = false;
 
 type ExtensionSettings = {
 	configuredPath: string;
 	serverExtraArgs: string[];
+	constProfile: number | undefined;
 	autoUpdateSiglusSsu: boolean;
 };
 
@@ -54,6 +66,9 @@ type RunProcessOptions = {
 	cwd?: string;
 	outputChannel?: vscode.OutputChannel;
 	token?: vscode.CancellationToken;
+	stdoutOnly?: boolean;
+	timeoutMs?: number;
+	acceptedExitCodes?: readonly number[];
 };
 
 type InstallProgressReporter = (message: string, increment?: number) => void;
@@ -119,11 +134,147 @@ function hideLanguageServerStatus(): void {
 
 function getSettings(): ExtensionSettings {
 	const config = vscode.workspace.getConfiguration('siglusSS');
+	const profileSetting = config.inspect<number | null>('constProfile');
+	const { profile, serverExtraArgs } = resolveConstProfile(
+		profileSetting?.workspaceValue !== undefined ? profileSetting.workspaceValue : profileSetting?.globalValue,
+		normalizeStringArray(config.get<unknown>('serverExtraArgs')),
+	);
 	return {
-		configuredPath: (config.get<string>('siglusSsuPath') || 'siglus-ssu').trim() || 'siglus-ssu',
-		serverExtraArgs: normalizeStringArray(config.get<unknown>('serverExtraArgs')),
+		configuredPath: getConfiguredPath(),
+		serverExtraArgs,
+		constProfile: profile,
 		autoUpdateSiglusSsu: config.get<boolean>('autoUpdateSiglusSsu') !== false,
 	};
+}
+
+function getConfiguredPath(): string {
+	return (vscode.workspace.getConfiguration('siglusSS').get<string>('siglusSsuPath') || 'siglus-ssu').trim() || 'siglus-ssu';
+}
+
+function currentConstProfile(): number | undefined {
+	const settings = getSettings();
+	const key = JSON.stringify(resolveCommandSpec(settings.configuredPath));
+	return settings.constProfile ?? (runningCommandKey === key ? runningConstProfile : undefined) ??
+		(constProfileCatalog?.commandKey === key ? constProfileCatalog.value.default : undefined);
+}
+
+async function queryConstProfiles(commandSpec: CommandSpec): Promise<ConstProfileCatalog> {
+	const commandKey = JSON.stringify(commandSpec);
+	constProfileCatalog = undefined;
+	// --version exits without starting an LSP even if a future CLI accepts the probe value.
+	const validationOutput = await runProcess(commandSpec.command, [...commandSpec.args, '--const-profile', '-1', '--version'], {
+		cwd: commandSpec.cwd,
+		acceptedExitCodes: [2],
+		timeoutMs: 10000,
+	});
+	const helpOutput = await runProcess(commandSpec.command, [...commandSpec.args, '--help'], {
+		cwd: commandSpec.cwd,
+		stdoutOnly: true,
+		timeoutMs: 10000,
+	});
+	const value = parseConstProfileCatalog(validationOutput, helpOutput);
+	if (JSON.stringify(resolveCommandSpec(getConfiguredPath())) === commandKey) {
+		constProfileCatalog = { commandKey, value };
+		updateConstProfileStatus();
+	}
+	return value;
+}
+
+function getConstProfileStatusItem(): vscode.StatusBarItem {
+	if (!constProfileStatusItem) {
+		constProfileStatusItem = vscode.window.createStatusBarItem(
+			'siglusSS.constProfile', vscode.StatusBarAlignment.Right, 100,
+		);
+		constProfileStatusItem.name = 'SiglusSS Const Profile';
+		constProfileStatusItem.command = 'siglusSS.selectConstProfile';
+	}
+	return constProfileStatusItem;
+}
+
+function updateConstProfileStatus(): void {
+	const item = getConstProfileStatusItem();
+	if (vscode.window.activeTextEditor?.document.languageId !== 'siglusss') {
+		item.hide();
+		return;
+	}
+	try {
+		const constProfile = currentConstProfile();
+		const pending = languageServerState === 'starting' ||
+			(languageServerState === 'running' && runningConstProfile !== constProfile);
+		const icon = loadingConstProfiles ? 'sync~spin' : languageServerState === 'error' ? 'error' : pending ? 'sync~spin' : 'list-selection';
+		item.text = `$(${icon}) SiglusSS: Profile ${constProfile ?? '?'}`;
+		const status = loadingConstProfiles ? 'Loading available profile numbers...' : languageServerState === 'error'
+			? 'Language server failed to start. Click to choose a profile; see the SiglusSS output for details.'
+			: pending ? 'Applying profile...' : 'Click to select a const profile.';
+		item.tooltip = constProfile === undefined
+			? `Using the server's default profile. ${status}`
+			: `Profile ${constProfile}\n${status}`;
+	} catch (error) {
+		item.text = '$(error) SiglusSS: Profile ?';
+		item.tooltip = toErrorMessage(error);
+	}
+	item.show();
+}
+
+function selectConstProfile(): Promise<void> {
+	if (!constProfilePickerJob) {
+		constProfilePickerJob = showConstProfilePicker().finally(() => {
+			constProfilePickerJob = undefined;
+		});
+	}
+	return constProfilePickerJob;
+}
+
+async function showConstProfilePicker(): Promise<void> {
+	const commandSpec = resolveCommandSpec(getConfiguredPath());
+	let catalog: ConstProfileCatalog;
+	loadingConstProfiles = true;
+	updateConstProfileStatus();
+	try {
+		catalog = await queryConstProfiles(commandSpec);
+	} catch (error) {
+		void vscode.window.showErrorMessage(
+			`Cannot read const profiles from siglus-ssu. Check the configured path, or enter a profile number in SiglusSS > Const Profile in Settings. ${toErrorMessage(error)}`,
+		);
+		return;
+	} finally {
+		loadingConstProfiles = false;
+		updateConstProfileStatus();
+	}
+	let current: number | undefined;
+	try {
+		current = currentConstProfile();
+	} catch {
+		// Keep the picker available to repair an invalid setting or legacy argument.
+	}
+	const target = configurationTarget();
+	const scope = target === vscode.ConfigurationTarget.Workspace ? 'workspace' : 'user settings';
+	const profiles = [...catalog.profiles].sort((left, right) =>
+		Number(right === current) - Number(left === current),
+	);
+	const selection = await vscode.window.showQuickPick<vscode.QuickPickItem & { profile: number }>(
+		profiles.map((profile) => ({
+			label: String(profile),
+			description: profile === current ? 'Current' : undefined,
+			profile,
+		})),
+		{
+			title: 'SiglusSS: Select Const Profile',
+			placeHolder: `Choose a profile number. Saves to ${scope} and restarts the language server.`,
+		},
+	);
+	if (!selection || selection.profile === current) {
+		return;
+	}
+	if (JSON.stringify(resolveCommandSpec(getConfiguredPath())) !== JSON.stringify(commandSpec)) {
+		void vscode.window.showErrorMessage('The siglus-ssu path changed. Open the profile selector again.');
+		return;
+	}
+	try {
+		await vscode.workspace.getConfiguration('siglusSS').update('constProfile', selection.profile, target);
+	} catch (error) {
+		void vscode.window.showErrorMessage(`Failed to save SiglusSS const profile. ${toErrorMessage(error)}`);
+	}
 }
 
 function normalizeStringArray(value: unknown): string[] {
@@ -324,6 +475,8 @@ async function startLanguageClient(): Promise<void> {
 	const { LanguageClient } = await import('vscode-languageclient/node');
 	const outputChannel = getServerOutputChannel();
 	const settings = getSettings();
+	languageServerState = 'starting';
+	updateConstProfileStatus();
 	setLanguageServerStatus(
 		'$(sync~spin) SiglusSS LSP',
 		'Starting SiglusSS language server...',
@@ -334,9 +487,20 @@ async function startLanguageClient(): Promise<void> {
 		`Checking ${commandLabel(commandSpec.command, [...commandSpec.args, '-lsp'])}`,
 	);
 	await ensureLanguageServerCommandAvailable(commandSpec);
+	let catalog: ConstProfileCatalog | undefined;
+	try {
+		catalog = await queryConstProfiles(commandSpec);
+	} catch (error) {
+		// A CLI with different help/validation text can still start with its configured profile.
+		outputChannel.appendLine(`Const profile discovery unavailable: ${toErrorMessage(error)}`);
+	}
+	if (catalog && settings.constProfile !== undefined && !catalog.profiles.includes(settings.constProfile)) {
+		throw new Error(`Const profile ${settings.constProfile} is no longer available. Use SiglusSS: Select Const Profile to choose an available number.`);
+	}
+	const profileArgs = settings.constProfile === undefined ? [] : ['--const-profile', String(settings.constProfile)];
 	const serverOptions: ServerOptions = {
 		command: commandSpec.command,
-		args: [...commandSpec.args, '-lsp', ...settings.serverExtraArgs],
+		args: [...commandSpec.args, ...profileArgs, '-lsp', ...settings.serverExtraArgs],
 		options: commandSpec.cwd ? { cwd: commandSpec.cwd } : undefined,
 	};
 	const clientOptions: LanguageClientOptions = {
@@ -372,6 +536,10 @@ async function startLanguageClient(): Promise<void> {
 		'Connecting to SiglusSS language server...',
 	);
 	await client.start();
+	runningConstProfile = settings.constProfile ?? catalog?.default;
+	runningCommandKey = JSON.stringify(commandSpec);
+	languageServerState = 'running';
+	updateConstProfileStatus();
 	setLanguageServerStatus(
 		'$(check) SiglusSS LSP',
 		'SiglusSS language server is running. Click to restart.',
@@ -381,7 +549,6 @@ async function startLanguageClient(): Promise<void> {
 
 async function stopLanguageClient(): Promise<void> {
 	const current = client;
-	client = undefined;
 	clearLspNotificationProgress();
 	setLanguageServerStatus(
 		'$(sync~spin) SiglusSS LSP',
@@ -390,6 +557,11 @@ async function stopLanguageClient(): Promise<void> {
 	if (current) {
 		await current.stop();
 	}
+	client = undefined;
+	runningConstProfile = undefined;
+	runningCommandKey = undefined;
+	languageServerState = 'stopped';
+	updateConstProfileStatus();
 	hideLanguageServerStatus();
 }
 
@@ -422,7 +594,7 @@ function isCancellationError(error: unknown): boolean {
 }
 
 function configurationTarget(): vscode.ConfigurationTarget {
-	return primaryWorkspaceFolder()
+	return vscode.workspace.workspaceFile || vscode.workspace.workspaceFolders?.length
 		? vscode.ConfigurationTarget.Workspace
 		: vscode.ConfigurationTarget.Global;
 }
@@ -592,7 +764,9 @@ async function runProcess(
 	outputChannel.appendLine(`> ${label}`);
 	return new Promise<string>((resolve, reject) => {
 		let output = '';
+		let stdout = '';
 		let finished = false;
+		let timeout: ReturnType<typeof setTimeout> | undefined;
 		let cancellationDisposable: vscode.Disposable | undefined;
 		const child = spawn(command, args, {
 			cwd: options.cwd,
@@ -603,6 +777,9 @@ async function runProcess(
 				return;
 			}
 			finished = true;
+			if (timeout !== undefined) {
+				clearTimeout(timeout);
+			}
 			cancellationDisposable?.dispose();
 			callback();
 		};
@@ -617,8 +794,15 @@ async function runProcess(
 			return;
 		}
 		cancellationDisposable = options.token?.onCancellationRequested(cancel);
+		if (options.timeoutMs !== undefined) {
+			timeout = setTimeout(() => finish(() => {
+				child.kill();
+				reject(new Error(`Timed out while running ${label}.`));
+			}), options.timeoutMs);
+		}
 		child.stdout.on('data', (chunk: Buffer) => {
 			const text = chunk.toString('utf8');
+			stdout += text;
 			output += text;
 			outputChannel.append(text);
 		});
@@ -632,8 +816,8 @@ async function runProcess(
 		});
 		child.on('close', (code) => {
 			finish(() => {
-				if (code === 0) {
-					resolve(output);
+				if (code === 0 || (code !== null && options.acceptedExitCodes?.includes(code))) {
+					resolve(options.stdoutOnly ? stdout : output);
 					return;
 				}
 				const detail = output.trim();
@@ -996,8 +1180,7 @@ async function installSiglusSsuWithProgress(): Promise<void> {
 						throw new Error('SiglusSS setup was cancelled.');
 					}
 					reportProgress('Restarting language server...', 25);
-					await stopLanguageClient();
-					await startLanguageClient();
+					await restartLanguageClientProcess();
 					reportProgress('Ready.', 5);
 				},
 			);
@@ -1035,6 +1218,8 @@ function scheduleSiglusSsuInstallWithProgress(): void {
 }
 
 async function handleLanguageServerStartError(error: unknown): Promise<void> {
+	languageServerState = 'error';
+	updateConstProfileStatus();
 	setLanguageServerStatus(
 		'$(error) SiglusSS LSP',
 		`SiglusSS language server failed to start: ${toErrorMessage(error)}`,
@@ -1068,11 +1253,39 @@ async function handleLanguageServerStartError(error: unknown): Promise<void> {
 	}
 }
 
-async function restartLanguageClient(): Promise<void> {
+function queueLanguageClientOperation<T>(operation: () => Promise<T>): Promise<T> {
+	const job = languageClientOperation.then(operation);
+	languageClientOperation = job.then(() => undefined, () => undefined);
+	return job;
+}
+
+function restartLanguageClientProcess(): Promise<boolean> {
+	const generation = ++languageServerGeneration;
+	return queueLanguageClientOperation(async () => {
+		if (isDeactivating || generation !== languageServerGeneration) {
+			return false;
+		}
+		try {
+			await stopLanguageClient();
+			if (isDeactivating || generation !== languageServerGeneration) {
+				return false;
+			}
+			await startLanguageClient();
+			return generation === languageServerGeneration;
+		} catch (error) {
+			if (isDeactivating || generation !== languageServerGeneration) {
+				return false;
+			}
+			throw error;
+		}
+	});
+}
+
+async function restartLanguageClient(showNotification = true): Promise<void> {
 	try {
-		await stopLanguageClient();
-		await startLanguageClient();
-		void vscode.window.showInformationMessage('SiglusSS language server restarted.');
+		if (await restartLanguageClientProcess() && showNotification) {
+			void vscode.window.showInformationMessage('SiglusSS language server restarted.');
+		}
 	} catch (error) {
 		await handleLanguageServerStartError(error);
 	}
@@ -1081,13 +1294,17 @@ async function restartLanguageClient(): Promise<void> {
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
 	context.subscriptions.push(getServerOutputChannel());
 	context.subscriptions.push(getLanguageServerStatusItem());
+	context.subscriptions.push(getConstProfileStatusItem());
+	context.subscriptions.push(vscode.window.onDidChangeActiveTextEditor(updateConstProfileStatus));
+	updateConstProfileStatus();
 	context.subscriptions.push(
 		vscode.workspace.onDidOpenTextDocument((document) => {
 			void ensureSiglusEncoding(document);
 		}),
 	);
 	context.subscriptions.push(
-		vscode.commands.registerCommand('siglusSS.restartLanguageServer', restartLanguageClient),
+		vscode.commands.registerCommand('siglusSS.restartLanguageServer', () => restartLanguageClient()),
+		vscode.commands.registerCommand('siglusSS.selectConstProfile', selectConstProfile),
 	);
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeConfiguration((event) => {
@@ -1099,9 +1316,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			}
 			if (
 				event.affectsConfiguration('siglusSS.siglusSsuPath') ||
-				event.affectsConfiguration('siglusSS.serverExtraArgs')
+				event.affectsConfiguration('siglusSS.serverExtraArgs') ||
+				event.affectsConfiguration('siglusSS.constProfile')
 			) {
-				void restartLanguageClient();
+				updateConstProfileStatus();
+				void restartLanguageClient(false);
 			}
 		}),
 	);
@@ -1109,13 +1328,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		void ensureSiglusEncoding(document);
 	}
 	try {
-		await startLanguageClient();
-		scheduleSiglusSsuUpdateCheck(context);
+		if (await restartLanguageClientProcess()) {
+			scheduleSiglusSsuUpdateCheck(context);
+		}
 	} catch (error) {
 		await handleLanguageServerStartError(error);
 	}
 }
 
 export async function deactivate(): Promise<void> {
-	await stopLanguageClient();
+	isDeactivating = true;
+	languageServerGeneration += 1;
+	await queueLanguageClientOperation(stopLanguageClient);
 }
