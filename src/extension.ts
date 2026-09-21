@@ -504,6 +504,8 @@ async function startLanguageClient(): Promise<void> {
 		options: commandSpec.cwd ? { cwd: commandSpec.cwd } : undefined,
 	};
 	const clientOptions: LanguageClientOptions = {
+		// Settings take effect through CLI arguments and a restart. Configuration
+		// synchronization would send notifications while the old client is stopping.
 		documentSelector: [{ scheme: 'file', language: 'siglusss' }],
 		outputChannel,
 		middleware: {
@@ -520,9 +522,6 @@ async function startLanguageClient(): Promise<void> {
 					setTimeout(() => finishLspNotificationProgress(workDoneToken), 1000);
 				}
 			},
-		},
-		synchronize: {
-			configurationSection: 'siglusSS',
 		},
 	};
 	client = new LanguageClient(
