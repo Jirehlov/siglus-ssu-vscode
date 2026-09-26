@@ -868,7 +868,7 @@ async function resolvePythonConsoleScript(
 	return scriptPath || undefined;
 }
 
-async function runSiglusSsuInit(
+async function configureInstalledSiglusSsuPath(
 	pythonCommand: string,
 	reportProgress: InstallProgressReporter,
 	token: vscode.CancellationToken,
@@ -881,33 +881,15 @@ async function runSiglusSsuInit(
 		token,
 		outputChannel,
 	);
-	const initCandidates: CommandSpec[] = [];
-	if (installedScriptPath && existsSync(installedScriptPath)) {
-		initCandidates.push({ command: installedScriptPath, args: [] });
+	if (
+		installedScriptPath &&
+		existsSync(installedScriptPath) &&
+		getSettings().configuredPath === 'siglus-ssu'
+	) {
+		await vscode.workspace
+			.getConfiguration('siglusSS')
+			.update('siglusSsuPath', installedScriptPath, configurationTarget());
 	}
-	initCandidates.push({ command: 'siglus-ssu', args: [] });
-	reportProgress('Running init --force...', 10);
-	let lastError: unknown;
-	for (const candidate of initCandidates) {
-		try {
-			await runProcess(candidate.command, [...candidate.args, 'init', '--force'], {
-				outputChannel,
-				token,
-			});
-			if (candidate.command !== 'siglus-ssu' && getSettings().configuredPath === 'siglus-ssu') {
-				await vscode.workspace
-					.getConfiguration('siglusSS')
-					.update('siglusSsuPath', candidate.command, configurationTarget());
-			}
-			return;
-		} catch (error) {
-			lastError = error;
-			if (!isMissingCommandError(error)) {
-				throw error;
-			}
-		}
-	}
-	throw lastError instanceof Error ? lastError : new Error('Failed to run siglus-ssu init --force.');
 }
 
 async function ensureLanguageServerCommandAvailable(commandSpec: CommandSpec): Promise<void> {
@@ -1174,17 +1156,22 @@ async function installSiglusSsuWithProgress(): Promise<void> {
 					if (token.isCancellationRequested) {
 						throw new Error('SiglusSS setup was cancelled.');
 					}
-					await runSiglusSsuInit(pythonCommand, reportProgress, token, outputChannel);
+					await configureInstalledSiglusSsuPath(
+						pythonCommand,
+						reportProgress,
+						token,
+						outputChannel,
+					);
 					if (token.isCancellationRequested) {
 						throw new Error('SiglusSS setup was cancelled.');
 					}
-					reportProgress('Restarting language server...', 25);
+					reportProgress('Restarting language server...', 35);
 					await restartLanguageClientProcess();
 					reportProgress('Ready.', 5);
 				},
 			);
 			void vscode.window.showInformationMessage(
-				'siglus-ssu installed, initialized, and the language server was restarted.',
+				'siglus-ssu installed and the language server was restarted.',
 			);
 		} catch (error) {
 			if (isCancellationError(error)) {
@@ -1193,7 +1180,7 @@ async function installSiglusSsuWithProgress(): Promise<void> {
 			}
 			outputChannel.show(true);
 			void vscode.window.showErrorMessage(
-				`Failed to install and initialize siglus-ssu. ${toErrorMessage(error)}`,
+				`Failed to install siglus-ssu. ${toErrorMessage(error)}`,
 			);
 		} finally {
 			isInstallingSiglusSsu = false;
