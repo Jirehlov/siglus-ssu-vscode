@@ -2,7 +2,7 @@
   "name": "siglus-ssu-vscode",
   "displayName": "SiglusSS Support",
   "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
-  "version": "0.0.13",
+  "version": "0.0.14",
   "publisher": "Jirehlov",
   "license": "MIT",
   "repository": {
@@ -16,11 +16,6 @@
     "Programming Languages",
     "Linters"
   ],
-  "activationEvents": [
-    "onLanguage:siglusss",
-    "onCommand:siglusSS.restartLanguageServer",
-    "onCommand:siglusSS.selectConstProfile"
-  ],
   "main": "./out/extension.js",
   "files": [
     "out",
@@ -32,6 +27,23 @@
     "package.json"
   ],
   "contributes": {
+    "colors": [
+      {
+        "id": "siglusSS.readFlagBackground",
+        "description": "Background of source fragments marked as read in read.sav.",
+        "defaults": { "dark": "#268BEB33", "light": "#1769AA26", "highContrast": "#268BEB66", "highContrastLight": "#1769AA33" }
+      },
+      {
+        "id": "siglusSS.unreadFlagBackground",
+        "description": "Background of source fragments not marked as read in read.sav.",
+        "defaults": { "dark": "#FF315C80", "light": "#D32F4F66", "highContrast": "#FF315CB3", "highContrastLight": "#C6204080" }
+      },
+      {
+        "id": "siglusSS.mixedFlagBackground",
+        "description": "Background where read and unread flag source ranges overlap.",
+        "defaults": { "dark": "#9C80DC40", "light": "#7951B82E", "highContrast": "#9C80DC66", "highContrastLight": "#7951B844" }
+      }
+    ],
     "languages": [
       {
         "id": "siglusss",
@@ -108,8 +120,41 @@
       {
         "command": "siglusSS.selectConstProfile",
         "title": "SiglusSS: Select Const Profile"
+      },
+      {
+        "command": "siglusSS.readFlags",
+        "title": "SiglusSS: Read Flags"
+      },
+      {
+        "command": "siglusSS.refreshReadFlags",
+        "title": "SiglusSS: Refresh Read Flags",
+        "enablement": "config.siglusSS.readFlagsMode"
+      },
+      {
+        "command": "siglusSS.goToFirstUnreadFlag",
+        "title": "SiglusSS: Go to First Unread Flag",
+        "enablement": "editorLangId == siglusss && config.siglusSS.readFlagsMode"
       }
     ],
+    "menus": {
+      "commandPalette": [
+        {
+          "command": "siglusSS.goToFirstUnreadFlag",
+          "when": "false"
+        },
+        {
+          "command": "siglusSS.readFlags",
+          "when": "false"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "siglusSS.goToFirstUnreadFlag",
+          "when": "editorLangId == siglusss && resourceExtname =~ /^\\.ss$/i",
+          "group": "navigation@90"
+        }
+      ]
+    },
     "configurationDefaults": {
       "[siglusss]": {
         "editor.semanticHighlighting.enabled": true,
@@ -178,6 +223,18 @@
     "configuration": {
       "title": "SiglusSS",
       "properties": {
+        "siglusSS.readFlagsMode": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "markdownDescription": "Enable read flags mode for saved states, precise source backgrounds, counts, hover details, and navigation. Click the **Read Flags** status item and choose **Enable Read Flags Mode** or **Disable Read Flags Mode**. Changes restart the language server. Turning the mode off stops saved-flag processing and keeps the selected save path. If no save is selected, enabling the mode opens a file picker first."
+        },
+        "siglusSS.readSavPath": {
+          "type": "string",
+          "default": "",
+          "scope": "window",
+          "markdownDescription": "Selected path to the game's `read.sav`, used while `siglusSS.readFlagsMode` is enabled. Requires a `siglus-ssu` build with read-flag support. Click the **Read Flags** status item and choose **Select Read Save...** to select or replace a file without toggling the mode or moving the cursor. Supports the same path variables as `siglusSS.siglusSsuPath`; relative paths use the workspace directory. Changes restart the server only while read flags mode is enabled. An empty path uses `--read-sav` from `siglusSS.serverExtraArgs` when the mode is enabled."
+        },
         "siglusSS.siglusSsuPath": {
           "type": "string",
           "default": "siglus-ssu",

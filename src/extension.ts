@@ -6,10 +6,11 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { parseConstProfileCatalog, resolveConstProfile, type ConstProfileCatalog } from './constProfiles';
 import {
-	type LanguageClient,
+	LanguageClient,
 	type LanguageClientOptions,
-	type ProgressToken,
 	type ServerOptions,
+	State,
+	type Range as ProtocolRange,
 	WorkDoneProgress,
 	type WorkDoneProgressBegin,
 	type WorkDoneProgressEnd,
@@ -21,10 +22,7 @@ let serverOutput: vscode.LogOutputChannel | undefined;
 let installSiglusSsuJob: Promise<void> | undefined;
 let installSiglusSsuScheduled = false;
 let isInstallingSiglusSsu = false;
-let siglusSsuUpdateCheckJob: Promise<void> | undefined;
-let siglusSsuUpdateCheckScheduled = false;
 const siglusEncodingJobs = new Map<string, Promise<void>>();
-const SIGLUS_ENCODINGS = ['shiftjis', 'utf8bom', 'utf8'] as const;
 const SKIPPED_SIGLUS_SSU_VERSION_KEY = 'siglusSS.skippedSiglusSsuVersion';
 const LSP_PROGRESS_REQUEST_METHODS = new Set([
 	'textDocument/diagnostic',
@@ -48,11 +46,14 @@ let runningCommandKey: string | undefined;
 let constProfileCatalog: { commandKey: string; value: ConstProfileCatalog } | undefined;
 let constProfilePickerJob: Promise<void> | undefined;
 let loadingConstProfiles = false;
+let readFlagController: ReadFlagController | undefined;
 
 type ExtensionSettings = {
 	configuredPath: string;
 	serverExtraArgs: string[];
 	constProfile: number | undefined;
+	readFlagsMode: boolean;
+	readSavPath: string;
 	autoUpdateSiglusSsu: boolean;
 };
 
@@ -64,7 +65,6 @@ type CommandSpec = {
 
 type RunProcessOptions = {
 	cwd?: string;
-	outputChannel?: vscode.OutputChannel;
 	token?: vscode.CancellationToken;
 	stdoutOnly?: boolean;
 	timeoutMs?: number;
@@ -86,16 +86,387 @@ type LspNotificationProgressState = {
 	resolve?: () => void;
 };
 
+type SiglusEncoding = 'shiftjis' | 'utf8bom' | 'utf8';
+
 type DecodedCandidate = {
-	encoding: (typeof SIGLUS_ENCODINGS)[number];
+	encoding: SiglusEncoding;
 	exact: boolean;
 	text: string | undefined;
 };
 
-class MissingSiglusSsuError extends Error {
-	constructor(message: string) {
-		super(message);
-		this.name = 'MissingSiglusSsuError';
+type ReadFlagReport = {
+	uri: string;
+	version: number | null;
+	status: string;
+	message?: string;
+	flagCount?: number | null;
+	savedFlagCount?: number | null;
+	readCount?: number | null;
+	unreadCount?: number | null;
+	items: { index: number; read: boolean; ranges: ProtocolRange[] }[];
+};
+
+class ReadFlagController implements vscode.Disposable {
+	private readonly decorations = ['read', 'unread', 'mixed'].map((state) =>
+		vscode.window.createTextEditorDecorationType({
+			backgroundColor: new vscode.ThemeColor(`siglusSS.${state}FlagBackground`),
+			rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
+		}),
+	);
+	private readonly status = vscode.window.createStatusBarItem('siglusSS.readFlags', vscode.StatusBarAlignment.Right, 99);
+	private modeEnabled = vscode.workspace.getConfiguration('siglusSS').get<boolean>('readFlagsMode') === true;
+	private readonly jobs = new Map<string, { timer?: NodeJS.Timeout; cancellation: vscode.CancellationTokenSource }>();
+	private readonly reports = new Map<string, ReadFlagReport>();
+	private readonly subscriptions: vscode.Disposable[];
+	private connection: vscode.Disposable[] = [];
+	private languageClient: LanguageClient | undefined;
+	private savePath = '';
+
+	constructor() {
+		this.status.name = 'SiglusSS Read Flags';
+		this.status.command = 'siglusSS.readFlags';
+		this.subscriptions = [
+			vscode.window.onDidChangeActiveTextEditor(() => this.refresh()),
+			vscode.window.onDidChangeVisibleTextEditors(() => this.refresh()),
+			vscode.window.onDidChangeWindowState((state) => {
+				if (state.focused) {
+					this.refresh();
+				}
+			}),
+			vscode.workspace.onDidChangeTextDocument((event) => {
+				if (isSiglusDocument(event.document) && event.contentChanges.length > 0) {
+					this.refresh(undefined, 250);
+				}
+			}),
+			vscode.workspace.onDidSaveTextDocument((document) => {
+				if (isSiglusDocument(document)) {
+					this.refresh();
+				}
+			}),
+			vscode.workspace.onDidCloseTextDocument((document) => {
+				this.invalidate(document.uri.toString());
+				this.updateStatus();
+			}),
+			vscode.workspace.onDidChangeConfiguration((event) => {
+				if (event.affectsConfiguration('siglusSS.readFlagsMode') ||
+					(this.modeEnabled && event.affectsConfiguration('siglusSS.readSavPath'))) {
+					this.modeEnabled = vscode.workspace.getConfiguration('siglusSS').get<boolean>('readFlagsMode') === true;
+					this.disconnect();
+				}
+			}),
+		];
+		this.updateStatus();
+	}
+
+	connect(languageClient: LanguageClient, savePath: string): void {
+		this.disconnect();
+		this.languageClient = languageClient;
+		this.savePath = this.modeEnabled ? savePath : '';
+		this.connection.push(languageClient.onDidChangeState((event) => {
+			if (event.newState === State.Running) {
+				this.refresh();
+			} else {
+				for (const uri of new Set([...this.jobs.keys(), ...this.reports.keys()])) {
+					this.invalidate(uri);
+				}
+				this.updateStatus();
+			}
+		}));
+		if (this.savePath) {
+			const watcher = vscode.workspace.createFileSystemWatcher(
+				new vscode.RelativePattern(path.dirname(this.savePath), path.basename(this.savePath)),
+			);
+			this.connection.push(
+				watcher,
+				watcher.onDidChange(() => this.refresh(undefined, 200)),
+				watcher.onDidCreate(() => this.refresh(undefined, 200)),
+				watcher.onDidDelete(() => this.refresh(undefined, 200)),
+			);
+		}
+		this.refresh();
+	}
+
+	disconnect(): void {
+		for (const subscription of this.connection) {
+			subscription.dispose();
+		}
+		this.connection = [];
+		this.languageClient = undefined;
+		this.savePath = '';
+		for (const uri of new Set([...this.jobs.keys(), ...this.reports.keys()])) {
+			this.invalidate(uri);
+		}
+		this.updateStatus();
+	}
+
+	refresh(document?: vscode.TextDocument, delay = 0): void {
+		if (!document) {
+			const documents = new Set(vscode.window.visibleTextEditors.map((editor) => editor.document));
+			const visibleUris = new Set([...documents].map((candidate) => candidate.uri.toString()));
+			for (const uri of new Set([...this.jobs.keys(), ...this.reports.keys()])) {
+				if (!visibleUris.has(uri)) {
+					this.invalidate(uri);
+				}
+			}
+			for (const candidate of documents) {
+				this.refresh(candidate, delay);
+			}
+			this.updateStatus();
+			return;
+		}
+		const uri = document.uri.toString();
+		this.invalidate(uri);
+		if (
+			!this.modeEnabled || !this.savePath || !this.languageClient?.isRunning() ||
+			this.languageClient.initializeResult?.capabilities.experimental?.siglusReadFlags?.version !== 1 ||
+			document.languageId !== 'siglusss' || !isSiglusDocument(document) ||
+			!document.uri.fsPath.toLowerCase().endsWith('.ss')
+		) {
+			return;
+		}
+		const cancellation = new vscode.CancellationTokenSource();
+		this.jobs.set(uri, {
+			timer: setTimeout(() => { void this.request(document, cancellation); }, delay),
+			cancellation,
+		});
+	}
+
+	private invalidate(uri: string): void {
+		const job = this.jobs.get(uri);
+		if (job) {
+			clearTimeout(job.timer);
+			job.cancellation.cancel();
+			job.cancellation.dispose();
+			this.jobs.delete(uri);
+		}
+		this.reports.delete(uri);
+		for (const editor of vscode.window.visibleTextEditors) {
+			if (editor.document.uri.toString() === uri) {
+				for (const decoration of this.decorations) {
+					editor.setDecorations(decoration, []);
+				}
+			}
+		}
+	}
+
+	async showMenu(): Promise<void> {
+		try {
+			const selected = await vscode.window.showQuickPick([
+				{
+					label: this.modeEnabled ? 'Disable Read Flags Mode' : 'Enable Read Flags Mode',
+					action: this.modeEnabled ? 'disable' : 'enable',
+				},
+				{ label: 'Select Read Save...', description: 'Choose or replace read.sav', action: 'select' },
+			], {
+				title: 'Read Flags',
+				placeHolder: this.modeEnabled ? 'Read Flags mode is on' : 'Read Flags mode is off',
+			});
+			if (!selected) {
+				return;
+			}
+			if (selected.action === 'select') {
+				await selectReadSave();
+				return;
+			}
+			const enabled = selected.action === 'enable';
+			if (enabled && !getSettings().readSavPath && !(await selectReadSave())) {
+				return;
+			}
+			await vscode.workspace.getConfiguration('siglusSS').update('readFlagsMode', enabled, configurationTarget());
+		} catch (error) {
+			void vscode.window.showErrorMessage(`Failed to configure read flags. ${toErrorMessage(error)}`);
+		}
+	}
+
+	async goToFirstUnreadFlag(): Promise<void> {
+		if (!this.modeEnabled) {
+			void vscode.window.showInformationMessage('Click the Read Flags status item and choose Enable Read Flags Mode first.');
+			return;
+		}
+		const editor = vscode.window.activeTextEditor;
+		if (!editor || editor.document.languageId !== 'siglusss' || !isSiglusDocument(editor.document) ||
+			!editor.document.uri.fsPath.toLowerCase().endsWith('.ss')) {
+			void vscode.window.showInformationMessage('Open a SiglusSS scene (.ss) to go to its first unread flag.');
+			return;
+		}
+		if (!this.savePath) {
+			void vscode.window.showInformationMessage('Click the Read Flags status item and choose Select Read Save first.');
+			return;
+		}
+		const languageClient = this.languageClient;
+		if (!languageClient?.isRunning()) {
+			void vscode.window.showWarningMessage('The SiglusSS language server is not running.');
+			return;
+		}
+		if (languageClient.initializeResult?.capabilities.experimental?.siglusReadFlags?.version !== 1) {
+			void vscode.window.showWarningMessage('The configured siglus-ssu build does not support read-flag navigation.');
+			return;
+		}
+		const document = editor.document;
+		const uri = document.uri.toString();
+		this.invalidate(uri);
+		const cancellation = new vscode.CancellationTokenSource();
+		this.jobs.set(uri, { cancellation });
+		this.updateStatus();
+		const report = await this.request(document, cancellation);
+		if (!report || vscode.window.activeTextEditor !== editor || this.languageClient !== languageClient ||
+			!languageClient.isRunning() || document.version !== report.version || this.reports.get(uri) !== report) {
+			return;
+		}
+		if (report.status !== 'matched') {
+			void vscode.window.showWarningMessage(`Cannot locate the first unread flag. ${this.mappingMessage(report)}`);
+			return;
+		}
+		const first = report.items.find((item) => !item.read);
+		if (!first) {
+			void vscode.window.showInformationMessage(report.flagCount === 0
+				? 'This scene has no read flags.' : 'All flags in this scene are marked as read.');
+			return;
+		}
+		if (first.ranges.length === 0) {
+			void vscode.window.showWarningMessage(`The first unread flag (${first.index}) has no precise source location.`);
+			return;
+		}
+		const range = first.ranges.reduce((earliest, candidate) =>
+			candidate.start.line < earliest.start.line ||
+			(candidate.start.line === earliest.start.line && candidate.start.character < earliest.start.character)
+				? candidate : earliest,
+		);
+		const target = languageClient.protocol2CodeConverter.asRange(range);
+		editor.selection = new vscode.Selection(target.start, target.end);
+		editor.revealRange(target, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+	}
+
+	private async request(document: vscode.TextDocument, cancellation: vscode.CancellationTokenSource): Promise<ReadFlagReport | undefined> {
+		const languageClient = this.languageClient;
+		const uri = document.uri.toString();
+		const version = document.version;
+		try {
+			if (!this.modeEnabled || !languageClient || cancellation.token.isCancellationRequested) {
+				return;
+			}
+			const report = await languageClient.sendRequest<ReadFlagReport>(
+				'siglus/readFlags', { textDocument: { uri } }, cancellation.token,
+			);
+			if (
+				this.jobs.get(uri)?.cancellation !== cancellation || document.isClosed ||
+				document.version !== version || report.uri !== uri || report.version !== version
+			) {
+				return;
+			}
+			this.reports.set(uri, report);
+			this.paint(document, report);
+			return report;
+		} catch (error) {
+			if (!cancellation.token.isCancellationRequested && this.jobs.get(uri)?.cancellation === cancellation) {
+				const failure = { uri, version, status: 'requestFailed', message: toErrorMessage(error), items: [] };
+				this.reports.set(uri, failure);
+				getServerOutputChannel().warn(`Read flags: ${toErrorMessage(error)}`);
+				return failure;
+			}
+		} finally {
+			if (this.jobs.get(uri)?.cancellation === cancellation) {
+				this.jobs.delete(uri);
+				cancellation.dispose();
+				this.updateStatus();
+			}
+		}
+	}
+
+	private paint(document: vscode.TextDocument, report: ReadFlagReport): void {
+		const ranges: vscode.Range[][] = [[], [], []];
+		const languageClient = this.languageClient;
+		if (this.modeEnabled && languageClient && report.status === 'matched' && report.version === document.version) {
+			const events = new Map<number, [number, number]>();
+			for (const item of report.items) {
+				const state = item.read ? 0 : 1;
+				for (const range of item.ranges) {
+					const converted = languageClient.protocol2CodeConverter.asRange(range);
+					const start = document.offsetAt(converted.start);
+					const end = document.offsetAt(converted.end);
+					if (start >= end) {
+						continue;
+					}
+					const opening = events.get(start) ?? [0, 0];
+					const closing = events.get(end) ?? [0, 0];
+					opening[state] += 1;
+					closing[state] -= 1;
+					events.set(start, opening);
+					events.set(end, closing);
+				}
+			}
+			let read = 0;
+			let unread = 0;
+			let previous = 0;
+			for (const [offset, delta] of [...events].sort(([left], [right]) => left - right)) {
+				if (offset > previous && (read > 0 || unread > 0)) {
+					const state = read > 0 ? unread > 0 ? 2 : 0 : 1;
+					ranges[state].push(new vscode.Range(document.positionAt(previous), document.positionAt(offset)));
+				}
+				read += delta[0];
+				unread += delta[1];
+				previous = offset;
+			}
+		}
+		for (const editor of vscode.window.visibleTextEditors) {
+			if (editor.document === document) {
+				this.decorations.forEach((decoration, state) => editor.setDecorations(decoration, ranges[state]));
+			}
+		}
+	}
+
+	private mappingMessage(report: ReadFlagReport | undefined): string {
+		return report?.status === 'countMismatch'
+			? `Flag count mismatch: source ${report.flagCount}, save ${report.savedFlagCount}. Saved states were not applied.`
+			: report?.status === 'missingScene'
+				? 'This scene has no saved entry. The engine initializes its flags as unread; no saved-state backgrounds are shown.'
+				: report?.message ?? report?.status ?? 'No read-flag report is available.';
+	}
+
+	private updateStatus(): void {
+		const document = vscode.window.activeTextEditor?.document;
+		if (!document || document.languageId !== 'siglusss' || !isSiglusDocument(document) ||
+			!document.uri.fsPath.toLowerCase().endsWith('.ss')) {
+			this.status.hide();
+			return;
+		}
+		const uri = document.uri.toString();
+		const report = this.reports.get(uri);
+		if (!this.modeEnabled) {
+			this.status.text = '$(book) Read Flags: Off';
+			this.status.tooltip = 'Read Flags mode is off. The selected save path is kept.';
+		} else if (!this.languageClient?.isRunning()) {
+			this.status.text = '$(warning) Read Flags: Server stopped';
+			this.status.tooltip = this.savePath;
+		} else if (!this.savePath) {
+			this.status.text = '$(book) Read Flags: Select save';
+			this.status.tooltip = 'Choose read.sav to view saved flag details.';
+		} else if (this.languageClient.initializeResult?.capabilities.experimental?.siglusReadFlags?.version !== 1) {
+			this.status.text = '$(warning) Read Flags: Unsupported';
+			this.status.tooltip = 'The configured siglus-ssu build does not support read-flag backgrounds.';
+		} else if (this.jobs.has(uri)) {
+			this.status.text = '$(sync~spin) Read Flags';
+			this.status.tooltip = `Loading saved flags from ${this.savePath}`;
+		} else if (report?.status === 'matched') {
+			this.status.text = `$(book) Read Flags: ${report.readCount}/${report.flagCount}`;
+			this.status.tooltip = `${this.savePath}\nRead: ${report.readCount}; unread: ${report.unreadCount}.\nDefault backgrounds: light blue = read; strong red = unread; violet = overlapping read and unread flags.\nHover the highlighted fragment for individual flag states. Use the scene editor's context menu to go to its first unread flag.`;
+		} else {
+			this.status.text = `$(warning) Read Flags: ${report?.status ?? 'Unavailable'}`;
+			this.status.tooltip = `${this.savePath}\n${this.mappingMessage(report)}`;
+		}
+		this.status.tooltip += '\nClick to enable or disable Read Flags mode, or select read.sav.';
+		this.status.show();
+	}
+
+	dispose(): void {
+		this.disconnect();
+		for (const subscription of this.subscriptions) {
+			subscription.dispose();
+		}
+		for (const decoration of this.decorations) {
+			decoration.dispose();
+		}
+		this.status.dispose();
 	}
 }
 
@@ -128,10 +499,6 @@ function setLanguageServerStatus(text: string, tooltip: string): void {
 	item.show();
 }
 
-function hideLanguageServerStatus(): void {
-	languageServerStatusItem?.hide();
-}
-
 function getSettings(): ExtensionSettings {
 	const config = vscode.workspace.getConfiguration('siglusSS');
 	const profileSetting = config.inspect<number | null>('constProfile');
@@ -139,10 +506,41 @@ function getSettings(): ExtensionSettings {
 		profileSetting?.workspaceValue !== undefined ? profileSetting.workspaceValue : profileSetting?.globalValue,
 		normalizeStringArray(config.get<unknown>('serverExtraArgs')),
 	);
+	const readFlagsMode = config.get<boolean>('readFlagsMode') === true;
+	let readSavPath = config.get<string>('readSavPath')?.trim() ?? '';
+	const explicitReadSav = Boolean(readSavPath);
+	const args: string[] = [];
+	for (let index = 0; index < serverExtraArgs.length; index += 1) {
+		const arg = serverExtraArgs[index];
+		if (arg === '--') {
+			args.push(...serverExtraArgs.slice(index));
+			break;
+		}
+		if (arg === '--read-sav') {
+			const value = serverExtraArgs[index + 1];
+			if (!value || value.startsWith('--')) {
+				throw new Error('--read-sav requires a file path. Select read.sav from the Read Flags status menu or set siglusSS.readSavPath.');
+			}
+			if (!explicitReadSav) {
+				if (readSavPath) {
+					throw new Error('--read-sav must be specified only once.');
+				}
+				readSavPath = value;
+			}
+			index += 1;
+		} else {
+			args.push(arg);
+		}
+	}
+	if (readFlagsMode && readSavPath) {
+		readSavPath = path.resolve(primaryWorkspaceFolder()?.uri.fsPath ?? process.cwd(), expandConfiguredPath(readSavPath));
+	}
 	return {
 		configuredPath: getConfiguredPath(),
-		serverExtraArgs,
+		serverExtraArgs: args,
 		constProfile: profile,
+		readFlagsMode,
+		readSavPath,
 		autoUpdateSiglusSsu: config.get<boolean>('autoUpdateSiglusSsu') !== false,
 	};
 }
@@ -362,18 +760,6 @@ function isSiglusDocument(document: vscode.TextDocument): boolean {
 	return lower.endsWith('.ss') || lower.endsWith('.inc');
 }
 
-function sameBytes(left: Uint8Array, right: Uint8Array): boolean {
-	if (left.byteLength !== right.byteLength) {
-		return false;
-	}
-	for (let index = 0; index < left.byteLength; index += 1) {
-		if (left[index] !== right[index]) {
-			return false;
-		}
-	}
-	return true;
-}
-
 function suspiciousTextScore(text: string): number {
 	let score = 0;
 	for (const char of text) {
@@ -399,14 +785,14 @@ function suspiciousTextScore(text: string): number {
 
 async function decodeCandidate(
 	bytes: Uint8Array,
-	encoding: (typeof SIGLUS_ENCODINGS)[number],
+	encoding: SiglusEncoding,
 ): Promise<DecodedCandidate> {
 	try {
 		const text = await vscode.workspace.decode(bytes, { encoding });
 		const encoded = await vscode.workspace.encode(text, { encoding });
 		return {
 			encoding,
-			exact: sameBytes(bytes, encoded),
+			exact: Buffer.compare(bytes, encoded) === 0,
 			text,
 		};
 	} catch {
@@ -418,7 +804,7 @@ async function decodeCandidate(
 	}
 }
 
-async function detectSiglusEncoding(uri: vscode.Uri): Promise<(typeof SIGLUS_ENCODINGS)[number]> {
+async function detectSiglusEncoding(uri: vscode.Uri): Promise<SiglusEncoding> {
 	const bytes = await vscode.workspace.fs.readFile(uri);
 	const hadBom =
 		bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
@@ -472,7 +858,6 @@ async function ensureSiglusEncoding(document: vscode.TextDocument): Promise<void
 }
 
 async function startLanguageClient(): Promise<void> {
-	const { LanguageClient } = await import('vscode-languageclient/node');
 	const outputChannel = getServerOutputChannel();
 	const settings = getSettings();
 	languageServerState = 'starting';
@@ -484,9 +869,12 @@ async function startLanguageClient(): Promise<void> {
 	const commandSpec = resolveCommandSpec(settings.configuredPath);
 	setLanguageServerStatus(
 		'$(sync~spin) SiglusSS LSP',
-		`Checking ${commandLabel(commandSpec.command, [...commandSpec.args, '-lsp'])}`,
+		`Checking ${[commandSpec.command, ...commandSpec.args, '-lsp'].join(' ')}`,
 	);
-	await ensureLanguageServerCommandAvailable(commandSpec);
+	await runProcess(commandSpec.command, [...commandSpec.args, '--version'], {
+		cwd: commandSpec.cwd,
+		timeoutMs: 10000,
+	});
 	let catalog: ConstProfileCatalog | undefined;
 	try {
 		catalog = await queryConstProfiles(commandSpec);
@@ -498,9 +886,11 @@ async function startLanguageClient(): Promise<void> {
 		throw new Error(`Const profile ${settings.constProfile} is no longer available. Use SiglusSS: Select Const Profile to choose an available number.`);
 	}
 	const profileArgs = settings.constProfile === undefined ? [] : ['--const-profile', String(settings.constProfile)];
+	const readSavPath = settings.readFlagsMode ? settings.readSavPath : '';
 	const serverOptions: ServerOptions = {
 		command: commandSpec.command,
-		args: [...commandSpec.args, ...profileArgs, '-lsp', ...settings.serverExtraArgs],
+		args: [...commandSpec.args, ...profileArgs, '-lsp', ...settings.serverExtraArgs,
+			...(readSavPath ? ['--read-sav', readSavPath] : [])],
 		options: commandSpec.cwd ? { cwd: commandSpec.cwd } : undefined,
 	};
 	const clientOptions: LanguageClientOptions = {
@@ -535,6 +925,7 @@ async function startLanguageClient(): Promise<void> {
 		'Connecting to SiglusSS language server...',
 	);
 	await client.start();
+	readFlagController?.connect(client, readSavPath);
 	runningConstProfile = settings.constProfile ?? catalog?.default;
 	runningCommandKey = JSON.stringify(commandSpec);
 	languageServerState = 'running';
@@ -543,11 +934,12 @@ async function startLanguageClient(): Promise<void> {
 		'$(check) SiglusSS LSP',
 		'SiglusSS language server is running. Click to restart.',
 	);
-	setTimeout(() => hideLanguageServerStatus(), 4000);
+	setTimeout(() => languageServerStatusItem?.hide(), 4000);
 }
 
 async function stopLanguageClient(): Promise<void> {
 	const current = client;
+	readFlagController?.disconnect();
 	clearLspNotificationProgress();
 	setLanguageServerStatus(
 		'$(sync~spin) SiglusSS LSP',
@@ -561,7 +953,7 @@ async function stopLanguageClient(): Promise<void> {
 	runningCommandKey = undefined;
 	languageServerState = 'stopped';
 	updateConstProfileStatus();
-	hideLanguageServerStatus();
+	languageServerStatusItem?.hide();
 }
 
 function toErrorMessage(error: unknown): string {
@@ -576,20 +968,10 @@ function isMissingCommandError(error: unknown): boolean {
 	return (
 		/\bENOENT\b/i.test(message) ||
 		/\bnot recognized\b/i.test(message) ||
-		/\bcommand not found\b/i.test(message) ||
 		/\bnot found\b/i.test(message) ||
 		/\bno such file or directory\b/i.test(message) ||
 		/\bfailed to spawn\b/i.test(message)
 	);
-}
-
-function isMissingLanguageClientModuleError(error: unknown): boolean {
-	const message = toErrorMessage(error);
-	return /Cannot find module ['"]vscode-languageclient\/node['"]/i.test(message);
-}
-
-function isCancellationError(error: unknown): boolean {
-	return /\bcancelled\b/i.test(toErrorMessage(error));
 }
 
 function configurationTarget(): vscode.ConfigurationTarget {
@@ -598,19 +980,27 @@ function configurationTarget(): vscode.ConfigurationTarget {
 		: vscode.ConfigurationTarget.Global;
 }
 
-function commandLabel(command: string, args: string[]): string {
-	return [command, ...args].join(' ');
+async function selectReadSave(): Promise<boolean> {
+	const selected = await vscode.window.showOpenDialog({
+		canSelectFiles: true,
+		canSelectFolders: false,
+		canSelectMany: false,
+		openLabel: 'Select Read Save',
+		title: 'Select the game\'s read.sav',
+		filters: { 'Siglus save files': ['sav'] },
+	});
+	if (selected?.[0]) {
+		try {
+			await vscode.workspace.getConfiguration('siglusSS').update('readSavPath', selected[0].fsPath, configurationTarget());
+			return true;
+		} catch (error) {
+			void vscode.window.showErrorMessage(`Failed to save the read.sav path. ${toErrorMessage(error)}`);
+		}
+	}
+	return false;
 }
 
-function delay(milliseconds: number): Promise<void> {
-	return new Promise((resolve) => setTimeout(resolve, milliseconds));
-}
-
-function lspProgressTokenKey(token: ProgressToken): string {
-	return typeof token === 'string' ? `s:${token}` : `n:${token}`;
-}
-
-function nextLspProgressToken(method: string): ProgressToken {
+function nextLspProgressToken(method: string): string {
 	lspProgressTokenCounter += 1;
 	return `siglusSS:${method}:${Date.now()}:${lspProgressTokenCounter}`;
 }
@@ -632,22 +1022,17 @@ function canAttachWorkDoneToken(method: string, params: unknown): params is Reco
 		params !== null &&
 		typeof params === 'object' &&
 		!Array.isArray(params) &&
-		!Object.prototype.hasOwnProperty.call(params, 'workDoneToken')
+		!Object.hasOwn(params, 'workDoneToken')
 	);
 }
 
-function createLspNotificationProgress(token: ProgressToken, params: WorkDoneProgressBegin): void {
-	const key = lspProgressTokenKey(token);
-	const existing = lspProgressStates.get(key);
-	if (existing) {
-		finishLspNotificationProgress(token);
-	}
+function createLspNotificationProgress(token: string, params: WorkDoneProgressBegin): void {
 	const state: LspNotificationProgressState = {
 		closed: false,
 		reportedPercentage: 0,
 		pending: [params],
 	};
-	lspProgressStates.set(key, state);
+	lspProgressStates.set(token, state);
 	void Promise.resolve(
 		vscode.window.withProgress(
 			{
@@ -665,15 +1050,12 @@ function createLspNotificationProgress(token: ProgressToken, params: WorkDonePro
 				}
 				await new Promise<void>((resolve) => {
 					state.resolve = resolve;
-					if (state.closed) {
-						resolve();
-					}
 				});
 			},
 		),
 	)
 		.finally(() => {
-			lspProgressStates.delete(key);
+			lspProgressStates.delete(token);
 		});
 }
 
@@ -703,14 +1085,14 @@ function reportLspNotificationProgress(
 }
 
 function handleLspNotificationProgress(
-	token: ProgressToken,
+	token: string,
 	params: LspWorkDoneProgress,
 ): void {
 	if (params.kind === 'begin') {
 		createLspNotificationProgress(token, params);
 		return;
 	}
-	const state = lspProgressStates.get(lspProgressTokenKey(token));
+	const state = lspProgressStates.get(token);
 	if (!state) {
 		return;
 	}
@@ -720,25 +1102,22 @@ function handleLspNotificationProgress(
 	}
 }
 
-function finishLspNotificationProgress(token: ProgressToken): void {
-	const key = lspProgressTokenKey(token);
-	const state = lspProgressStates.get(key);
+function finishLspNotificationProgress(token: string): void {
+	const state = lspProgressStates.get(token);
 	if (state && !state.closed) {
 		state.closed = true;
 		state.resolve?.();
 	}
-	lspProgressDisposables.get(key)?.dispose();
-	lspProgressDisposables.delete(key);
+	lspProgressDisposables.get(token)?.dispose();
+	lspProgressDisposables.delete(token);
 }
 
-function registerLspNotificationProgress(token: ProgressToken): void {
+function registerLspNotificationProgress(token: string): void {
 	if (!client) {
 		return;
 	}
-	const key = lspProgressTokenKey(token);
-	lspProgressDisposables.get(key)?.dispose();
 	lspProgressDisposables.set(
-		key,
+		token,
 		client.onProgress(WorkDoneProgress.type, token, (params) => {
 			handleLspNotificationProgress(token, params);
 		}),
@@ -746,9 +1125,8 @@ function registerLspNotificationProgress(token: ProgressToken): void {
 }
 
 function clearLspNotificationProgress(): void {
-	for (const key of [...lspProgressDisposables.keys()]) {
-		const token = key.slice(2);
-		finishLspNotificationProgress(key.startsWith('n:') ? Number(token) : token);
+	for (const token of [...lspProgressDisposables.keys()]) {
+		finishLspNotificationProgress(token);
 	}
 }
 
@@ -757,11 +1135,15 @@ async function runProcess(
 	args: string[],
 	options: RunProcessOptions = {},
 ): Promise<string> {
-	const outputChannel = options.outputChannel ?? getServerOutputChannel();
-	const label = commandLabel(command, args);
+	const outputChannel = getServerOutputChannel();
+	const label = [command, ...args].join(' ');
 	outputChannel.appendLine('');
 	outputChannel.appendLine(`> ${label}`);
 	return new Promise<string>((resolve, reject) => {
+		if (options.token?.isCancellationRequested) {
+			reject(new Error(`${label} was cancelled.`));
+			return;
+		}
 		let output = '';
 		let stdout = '';
 		let finished = false;
@@ -788,10 +1170,6 @@ async function runProcess(
 				reject(new Error(`${label} was cancelled.`));
 			});
 		};
-		if (options.token?.isCancellationRequested) {
-			cancel();
-			return;
-		}
 		cancellationDisposable = options.token?.onCancellationRequested(cancel);
 		if (options.timeoutMs !== undefined) {
 			timeout = setTimeout(() => finish(() => {
@@ -799,14 +1177,12 @@ async function runProcess(
 				reject(new Error(`Timed out while running ${label}.`));
 			}), options.timeoutMs);
 		}
-		child.stdout.on('data', (chunk: Buffer) => {
-			const text = chunk.toString('utf8');
+		child.stdout.setEncoding('utf8').on('data', (text: string) => {
 			stdout += text;
 			output += text;
 			outputChannel.append(text);
 		});
-		child.stderr.on('data', (chunk: Buffer) => {
-			const text = chunk.toString('utf8');
+		child.stderr.setEncoding('utf8').on('data', (text: string) => {
 			output += text;
 			outputChannel.append(text);
 		});
@@ -833,37 +1209,34 @@ async function runProcess(
 async function installSiglusSsuPackage(
 	reportProgress: InstallProgressReporter,
 	token: vscode.CancellationToken,
-	outputChannel: vscode.OutputChannel,
 ): Promise<string> {
 	const args = ['-m', 'pip', 'install', '-U', 'siglus-ssu'];
 	reportProgress('Installing package...', 5);
 	try {
-		await runProcess('python', args, { outputChannel, token });
+		await runProcess('python', args, { token });
 		return 'python';
 	} catch (error) {
 		if (!isMissingCommandError(error)) {
 			throw error;
 		}
 		reportProgress('python was not found, trying python3...');
-		await runProcess('python3', args, { outputChannel, token });
+		await runProcess('python3', args, { token });
 		return 'python3';
 	}
 }
 
-async function resolvePythonConsoleScript(
+async function resolveSiglusSsuConsoleScript(
 	pythonCommand: string,
-	scriptName: string,
 	token: vscode.CancellationToken,
-	outputChannel: vscode.OutputChannel,
 ): Promise<string | undefined> {
 	const code = [
 		'import os, sys, sysconfig',
-		`name = ${JSON.stringify(scriptName)}`,
+		'name = "siglus-ssu"',
 		'if sys.platform == "win32":',
 		'    name += ".exe"',
 		'print(os.path.join(sysconfig.get_path("scripts"), name))',
 	].join('\n');
-	const output = await runProcess(pythonCommand, ['-c', code], { outputChannel, token });
+	const output = await runProcess(pythonCommand, ['-c', code], { token });
 	const scriptPath = output.trim().split(/\r?\n/).pop()?.trim();
 	return scriptPath || undefined;
 }
@@ -872,14 +1245,11 @@ async function configureInstalledSiglusSsuPath(
 	pythonCommand: string,
 	reportProgress: InstallProgressReporter,
 	token: vscode.CancellationToken,
-	outputChannel: vscode.OutputChannel,
 ): Promise<void> {
 	reportProgress('Locating siglus-ssu...', 55);
-	const installedScriptPath = await resolvePythonConsoleScript(
+	const installedScriptPath = await resolveSiglusSsuConsoleScript(
 		pythonCommand,
-		'siglus-ssu',
 		token,
-		outputChannel,
 	);
 	if (
 		installedScriptPath &&
@@ -890,65 +1260,6 @@ async function configureInstalledSiglusSsuPath(
 			.getConfiguration('siglusSS')
 			.update('siglusSsuPath', installedScriptPath, configurationTarget());
 	}
-}
-
-async function ensureLanguageServerCommandAvailable(commandSpec: CommandSpec): Promise<void> {
-	const args = [...commandSpec.args, '--version'];
-	const label = [commandSpec.command, ...args].join(' ');
-	await new Promise<void>((resolve, reject) => {
-		let output = '';
-		let finished = false;
-		const child = spawn(commandSpec.command, args, {
-			cwd: commandSpec.cwd,
-			windowsHide: true,
-		});
-		const timer = setTimeout(() => {
-			if (finished) {
-				return;
-			}
-			finished = true;
-			child.kill();
-			reject(new Error(`Timed out while checking ${label}.`));
-		}, 10000);
-		const finish = (callback: () => void) => {
-			if (finished) {
-				return;
-			}
-			finished = true;
-			clearTimeout(timer);
-			callback();
-		};
-		child.stdout.on('data', (chunk: Buffer) => {
-			output += chunk.toString('utf8');
-		});
-		child.stderr.on('data', (chunk: Buffer) => {
-			output += chunk.toString('utf8');
-		});
-		child.on('error', (error: NodeJS.ErrnoException) => {
-			finish(() => {
-				if (error.code === 'ENOENT') {
-					reject(new MissingSiglusSsuError(`${label} was not found.`));
-					return;
-				}
-				reject(error);
-			});
-		});
-		child.on('close', (code) => {
-			finish(() => {
-				if (code === 0) {
-					resolve();
-					return;
-				}
-				const detail = output.trim();
-				const message = `${label} exited with code ${code ?? 'unknown'}${detail ? `: ${detail}` : '.'}`;
-				if (isMissingCommandError(message)) {
-					reject(new MissingSiglusSsuError(message));
-					return;
-				}
-				reject(new Error(message));
-			});
-		});
-	});
 }
 
 function parseSiglusSsuVersion(output: string): string | undefined {
@@ -1034,71 +1345,48 @@ async function fetchLatestSiglusSsuVersion(): Promise<string | undefined> {
 }
 
 async function checkSiglusSsuUpdateWithProgress(context: vscode.ExtensionContext): Promise<void> {
-	if (siglusSsuUpdateCheckJob) {
-		return siglusSsuUpdateCheckJob;
-	}
-	siglusSsuUpdateCheckJob = (async () => {
-		const settings = getSettings();
-		const commandSpec = resolveCommandSpec(settings.configuredPath);
-		if (!isSiglusSsuAutoUpdateTarget(settings, commandSpec)) {
-			return;
-		}
-		try {
-			setLanguageServerStatus(
-				'$(sync~spin) SiglusSS update',
-				'Checking for siglus-ssu updates...',
-			);
-			const versionOutput = await runProcess(
-				commandSpec.command,
-				[...commandSpec.args, '--version'],
-				{
-					cwd: commandSpec.cwd,
-					outputChannel: getServerOutputChannel(),
-				},
-			);
-			const currentVersion = parseSiglusSsuVersion(versionOutput);
-			if (!currentVersion) {
-				return;
-			}
-			const latestVersion = await fetchLatestSiglusSsuVersion();
-			if (!latestVersion || compareVersions(latestVersion, currentVersion) <= 0) {
-				return;
-			}
-			if (context.globalState.get<string>(SKIPPED_SIGLUS_SSU_VERSION_KEY) === latestVersion) {
-				return;
-			}
-			const action = await vscode.window.showInformationMessage(
-				`siglus-ssu ${latestVersion} is available. Current version: ${currentVersion}.`,
-				'Update siglus-ssu',
-				'Skip this version',
-			);
-			if (action === 'Update siglus-ssu') {
-				await installSiglusSsuWithProgress();
-			} else if (action === 'Skip this version') {
-				await context.globalState.update(SKIPPED_SIGLUS_SSU_VERSION_KEY, latestVersion);
-			}
-		} catch (error) {
-			getServerOutputChannel().appendLine(
-				`siglus-ssu update check failed: ${toErrorMessage(error)}`,
-			);
-		} finally {
-			hideLanguageServerStatus();
-		}
-	})().finally(() => {
-		siglusSsuUpdateCheckJob = undefined;
-	});
-	return siglusSsuUpdateCheckJob;
-}
-
-function scheduleSiglusSsuUpdateCheck(context: vscode.ExtensionContext): void {
-	if (siglusSsuUpdateCheckJob || siglusSsuUpdateCheckScheduled) {
+	const settings = getSettings();
+	const commandSpec = resolveCommandSpec(settings.configuredPath);
+	if (!isSiglusSsuAutoUpdateTarget(settings, commandSpec)) {
 		return;
 	}
-	siglusSsuUpdateCheckScheduled = true;
-	setTimeout(() => {
-		siglusSsuUpdateCheckScheduled = false;
-		void checkSiglusSsuUpdateWithProgress(context);
-	}, 5000);
+	try {
+		setLanguageServerStatus(
+			'$(sync~spin) SiglusSS update',
+			'Checking for siglus-ssu updates...',
+		);
+		const versionOutput = await runProcess(
+			commandSpec.command,
+			[...commandSpec.args, '--version'],
+		);
+		const currentVersion = parseSiglusSsuVersion(versionOutput);
+		if (!currentVersion) {
+			return;
+		}
+		const latestVersion = await fetchLatestSiglusSsuVersion();
+		if (!latestVersion || compareVersions(latestVersion, currentVersion) <= 0) {
+			return;
+		}
+		if (context.globalState.get<string>(SKIPPED_SIGLUS_SSU_VERSION_KEY) === latestVersion) {
+			return;
+		}
+		const action = await vscode.window.showInformationMessage(
+			`siglus-ssu ${latestVersion} is available. Current version: ${currentVersion}.`,
+			'Update siglus-ssu',
+			'Skip this version',
+		);
+		if (action === 'Update siglus-ssu') {
+			await installSiglusSsuWithProgress();
+		} else if (action === 'Skip this version') {
+			await context.globalState.update(SKIPPED_SIGLUS_SSU_VERSION_KEY, latestVersion);
+		}
+	} catch (error) {
+		getServerOutputChannel().appendLine(
+			`siglus-ssu update check failed: ${toErrorMessage(error)}`,
+		);
+	} finally {
+		languageServerStatusItem?.hide();
+	}
 }
 
 async function promptForSiglusSsuPath(): Promise<void> {
@@ -1147,11 +1435,10 @@ async function installSiglusSsuWithProgress(): Promise<void> {
 						progress.report({ message, increment });
 					};
 					reportProgress('Starting setup...', 0);
-					await delay(250);
+					await new Promise<void>((resolve) => setTimeout(resolve, 250));
 					const pythonCommand = await installSiglusSsuPackage(
 						reportProgress,
 						token,
-						outputChannel,
 					);
 					if (token.isCancellationRequested) {
 						throw new Error('SiglusSS setup was cancelled.');
@@ -1160,7 +1447,6 @@ async function installSiglusSsuWithProgress(): Promise<void> {
 						pythonCommand,
 						reportProgress,
 						token,
-						outputChannel,
 					);
 					if (token.isCancellationRequested) {
 						throw new Error('SiglusSS setup was cancelled.');
@@ -1174,7 +1460,7 @@ async function installSiglusSsuWithProgress(): Promise<void> {
 				'siglus-ssu installed and the language server was restarted.',
 			);
 		} catch (error) {
-			if (isCancellationError(error)) {
+			if (/\bcancelled\b/i.test(toErrorMessage(error))) {
 				void vscode.window.showWarningMessage('SiglusSS setup cancelled.');
 				return;
 			}
@@ -1210,15 +1496,8 @@ async function handleLanguageServerStartError(error: unknown): Promise<void> {
 		'$(error) SiglusSS LSP',
 		`SiglusSS language server failed to start: ${toErrorMessage(error)}`,
 	);
-	setTimeout(() => hideLanguageServerStatus(), 8000);
-	if (isMissingLanguageClientModuleError(error)) {
-		serverOutput?.show(true);
-		void vscode.window.showErrorMessage(
-			'SiglusSS extension package is missing the vscode-languageclient runtime. Reinstall or update the VSIX.',
-		);
-		return;
-	}
-	if (!(error instanceof MissingSiglusSsuError) && !isMissingCommandError(error)) {
+	setTimeout(() => languageServerStatusItem?.hide(), 8000);
+	if (!isMissingCommandError(error)) {
 		serverOutput?.show(true);
 		void vscode.window.showErrorMessage(
 			`Failed to start SiglusSS language server. Check siglusSS.siglusSsuPath. ${toErrorMessage(error)}`,
@@ -1278,6 +1557,8 @@ async function restartLanguageClient(showNotification = true): Promise<void> {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+	readFlagController = new ReadFlagController();
+	context.subscriptions.push(readFlagController);
 	context.subscriptions.push(getServerOutputChannel());
 	context.subscriptions.push(getLanguageServerStatusItem());
 	context.subscriptions.push(getConstProfileStatusItem());
@@ -1291,6 +1572,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('siglusSS.restartLanguageServer', () => restartLanguageClient()),
 		vscode.commands.registerCommand('siglusSS.selectConstProfile', selectConstProfile),
+		vscode.commands.registerCommand('siglusSS.readFlags', () => readFlagController?.showMenu()),
+		vscode.commands.registerCommand('siglusSS.refreshReadFlags', () => readFlagController?.refresh()),
+		vscode.commands.registerCommand('siglusSS.goToFirstUnreadFlag', () => readFlagController?.goToFirstUnreadFlag()),
 	);
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeConfiguration((event) => {
@@ -1303,7 +1587,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			if (
 				event.affectsConfiguration('siglusSS.siglusSsuPath') ||
 				event.affectsConfiguration('siglusSS.serverExtraArgs') ||
-				event.affectsConfiguration('siglusSS.constProfile')
+				event.affectsConfiguration('siglusSS.constProfile') ||
+				event.affectsConfiguration('siglusSS.readFlagsMode') ||
+				(event.affectsConfiguration('siglusSS.readSavPath') &&
+					vscode.workspace.getConfiguration('siglusSS').get<boolean>('readFlagsMode') === true)
 			) {
 				updateConstProfileStatus();
 				void restartLanguageClient(false);
@@ -1315,7 +1602,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	}
 	try {
 		if (await restartLanguageClientProcess()) {
-			scheduleSiglusSsuUpdateCheck(context);
+			setTimeout(() => { void checkSiglusSsuUpdateWithProgress(context); }, 5000);
 		}
 	} catch (error) {
 		await handleLanguageServerStartError(error);
