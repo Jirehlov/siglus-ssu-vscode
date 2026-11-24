@@ -2,7 +2,7 @@
   "name": "siglus-ssu-vscode",
   "displayName": "SiglusSS Support",
   "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
-  "version": "0.0.14",
+  "version": "0.0.15",
   "publisher": "Jirehlov",
   "license": "MIT",
   "repository": {
@@ -134,6 +134,31 @@
         "command": "siglusSS.goToFirstUnreadFlag",
         "title": "SiglusSS: Go to First Unread Flag",
         "enablement": "editorLangId == siglusss && config.siglusSS.readFlagsMode"
+      },
+      {
+        "command": "siglusSS.goToLastUnreadFlag",
+        "title": "SiglusSS: Go to Last Unread Flag",
+        "enablement": "editorLangId == siglusss && config.siglusSS.readFlagsMode"
+      },
+      {
+        "command": "siglusSS.goToPreviousUnreadFlag",
+        "title": "SiglusSS: Go to Previous Unread Flag",
+        "enablement": "editorLangId == siglusss && config.siglusSS.readFlagsMode"
+      },
+      {
+        "command": "siglusSS.goToNextUnreadFlag",
+        "title": "SiglusSS: Go to Next Unread Flag",
+        "enablement": "editorLangId == siglusss && config.siglusSS.readFlagsMode"
+      },
+      {
+        "command": "siglusSS.markFlagRead",
+        "title": "SiglusSS: Mark Flags as Read",
+        "enablement": "editorLangId == siglusss && config.siglusSS.readFlagsMode"
+      },
+      {
+        "command": "siglusSS.markFlagUnread",
+        "title": "SiglusSS: Mark Flags as Unread",
+        "enablement": "editorLangId == siglusss && config.siglusSS.readFlagsMode"
       }
     ],
     "menus": {
@@ -145,6 +170,26 @@
         {
           "command": "siglusSS.readFlags",
           "when": "false"
+        },
+        {
+          "command": "siglusSS.goToLastUnreadFlag",
+          "when": "false"
+        },
+        {
+          "command": "siglusSS.goToPreviousUnreadFlag",
+          "when": "false"
+        },
+        {
+          "command": "siglusSS.goToNextUnreadFlag",
+          "when": "false"
+        },
+        {
+          "command": "siglusSS.markFlagRead",
+          "when": "false"
+        },
+        {
+          "command": "siglusSS.markFlagUnread",
+          "when": "false"
         }
       ],
       "editor/context": [
@@ -152,6 +197,31 @@
           "command": "siglusSS.goToFirstUnreadFlag",
           "when": "editorLangId == siglusss && resourceExtname =~ /^\\.ss$/i",
           "group": "navigation@90"
+        },
+        {
+          "command": "siglusSS.goToLastUnreadFlag",
+          "when": "editorLangId == siglusss && resourceExtname =~ /^\\.ss$/i && config.siglusSS.readFlagsMode",
+          "group": "navigation@91"
+        },
+        {
+          "command": "siglusSS.goToPreviousUnreadFlag",
+          "when": "editorLangId == siglusss && resourceExtname =~ /^\\.ss$/i && config.siglusSS.readFlagsMode",
+          "group": "navigation@92"
+        },
+        {
+          "command": "siglusSS.goToNextUnreadFlag",
+          "when": "editorLangId == siglusss && resourceExtname =~ /^\\.ss$/i && config.siglusSS.readFlagsMode",
+          "group": "navigation@93"
+        },
+        {
+          "command": "siglusSS.markFlagRead",
+          "when": "editorLangId == siglusss && resourceExtname =~ /^\\.ss$/i && siglusSS.canSetReadFlag",
+          "group": "navigation@94"
+        },
+        {
+          "command": "siglusSS.markFlagUnread",
+          "when": "editorLangId == siglusss && resourceExtname =~ /^\\.ss$/i && siglusSS.canSetReadFlag",
+          "group": "navigation@95"
         }
       ]
     },

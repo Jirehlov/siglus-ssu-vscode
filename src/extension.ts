@@ -94,6 +94,8 @@ type DecodedCandidate = {
 	text: string | undefined;
 };
 
+type FlagItem = { index: number; read: boolean; ranges: ProtocolRange[] };
+
 type ReadFlagReport = {
 	uri: string;
 	version: number | null;
@@ -103,7 +105,186 @@ type ReadFlagReport = {
 	savedFlagCount?: number | null;
 	readCount?: number | null;
 	unreadCount?: number | null;
-	items: { index: number; read: boolean; ranges: ProtocolRange[] }[];
+	mappingId?: string;
+	saveRevision?: string;
+	states?: string;
+	items: FlagItem[];
+};
+
+type FlagBoundary = { offset: number; position: vscode.Position; total: number; read: number };
+type FlagFragment = { flag: FlagItem; range: vscode.Range; start: FlagBoundary; end: FlagBoundary };
+type UnreadNavigation = 'first' | 'previous' | 'next' | 'last';
+
+function partitionPoint<T>(items: readonly T[], before: (item: T) => boolean): number {
+	let low = 0;
+	let high = items.length;
+	while (low < high) {
+		const middle = Math.floor((low + high) / 2);
+		if (before(items[middle])) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+	return low;
+}
+
+class ReadFlagIndex {
+	private readonly fragments: FlagFragment[] = [];
+	private readonly byFlag: FlagFragment[][];
+	private readonly maxEnds: number[] = [];
+	private readonly boundaries: FlagBoundary[];
+	private unread: FlagFragment[] = [];
+	firstUnread?: FlagItem;
+	lastUnread?: FlagItem;
+	decorations: vscode.Range[][] = [[], [], []];
+
+	constructor(private readonly items: FlagItem[], document: vscode.TextDocument, languageClient: LanguageClient) {
+		const events = new Map<number, FlagBoundary>();
+		const boundary = (position: vscode.Position): FlagBoundary => {
+			const offset = document.offsetAt(position);
+			let event = events.get(offset);
+			if (!event) {
+				event = { offset, position, total: 0, read: 0 };
+				events.set(offset, event);
+			}
+			return event;
+		};
+		this.byFlag = items.map(() => []);
+		for (const flag of items) {
+			for (const location of flag.ranges) {
+				const range = languageClient.protocol2CodeConverter.asRange(location);
+				if (range.isEmpty) {
+					continue;
+				}
+				const start = boundary(range.start);
+				const end = boundary(range.end);
+				start.total++;
+				end.total--;
+				if (flag.read) {
+					start.read++;
+					end.read--;
+				}
+				this.fragments.push({ flag, range, start, end });
+			}
+		}
+		this.fragments.sort((a, b) => a.start.offset - b.start.offset || a.flag.index - b.flag.index);
+		let maxEnd = 0;
+		for (const fragment of this.fragments) {
+			this.byFlag[fragment.flag.index].push(fragment);
+			maxEnd = Math.max(maxEnd, fragment.end.offset);
+			this.maxEnds.push(maxEnd);
+		}
+		this.boundaries = [...events.values()].sort((a, b) => a.offset - b.offset);
+		this.rebuild();
+	}
+
+	private rebuild(): void {
+		this.firstUnread = undefined;
+		this.lastUnread = undefined;
+		for (const flag of this.items) {
+			if (!flag.read) {
+				this.firstUnread ??= flag;
+				this.lastUnread = flag;
+			}
+		}
+		this.unread = this.fragments.filter(({ flag }) => !flag.read);
+		const ranges: vscode.Range[][] = [[], [], []];
+		let total = 0;
+		let read = 0;
+		let state = -1;
+		let start: vscode.Position | undefined;
+		for (const boundary of this.boundaries) {
+			total += boundary.total;
+			read += boundary.read;
+			const next = total === 0 ? -1 : read === total ? 0 : read === 0 ? 1 : 2;
+			if (next !== state) {
+				if (start && state >= 0) {
+					ranges[state].push(new vscode.Range(start, boundary.position));
+				}
+				state = next;
+				start = boundary.position;
+			}
+		}
+		this.decorations = ranges;
+	}
+
+	private change(index: number, read: boolean): boolean {
+		const flag = this.items[index];
+		if (flag.read === read) {
+			return false;
+		}
+		flag.read = read;
+		const delta = read ? 1 : -1;
+		for (const { start, end } of this.byFlag[index]) {
+			start.read += delta;
+			end.read -= delta;
+		}
+		return true;
+	}
+
+	update(states: Buffer | { indices: readonly number[]; read: boolean }): void {
+		let changed = false;
+		if (Buffer.isBuffer(states)) {
+			if (states.length !== this.items.length) {
+				throw new Error('The saved flag count changed.');
+			}
+			for (let i = 0; i < states.length; i++) {
+				if (this.change(i, states[i] !== 0)) {
+					changed = true;
+				}
+			}
+		} else {
+			for (const index of states.indices) {
+				if (this.change(index, states.read)) {
+					changed = true;
+				}
+			}
+		}
+		if (changed) {
+			this.rebuild();
+		}
+	}
+
+	unreadRange(action: UnreadNavigation, cursor: number): vscode.Range | undefined {
+		if (action === 'first' || action === 'last') {
+			const first = action === 'first';
+			const flag = first ? this.firstUnread : this.lastUnread;
+			return flag && this.byFlag[flag.index].at(first ? 0 : -1)?.range;
+		}
+		const previous = action === 'previous';
+		const boundary = partitionPoint(this.unread, ({ start }) =>
+			previous ? start.offset < cursor : start.offset <= cursor,
+		);
+		return this.unread[previous ? boundary - 1 : boundary]?.range;
+	}
+
+	flagsAt(document: vscode.TextDocument, selections: readonly vscode.Selection[]): FlagItem[] {
+		const flags = new Set<FlagItem>();
+		for (const selection of selections) {
+			const start = document.offsetAt(selection.start);
+			const end = document.offsetAt(selection.end);
+			const first = partitionPoint(this.maxEnds, (offset) => offset <= start);
+			for (let i = first; i < this.fragments.length; i++) {
+				const fragment = this.fragments[i];
+				if (selection.isEmpty ? fragment.start.offset > start : fragment.start.offset >= end) {
+					break;
+				}
+				if (fragment.end.offset > start) {
+					flags.add(fragment.flag);
+				}
+			}
+		}
+		return [...flags];
+	}
+}
+
+type FlagView = { report: ReadFlagReport; index?: ReadFlagIndex };
+type FlagJob = {
+	verifySave?: boolean;
+	timer?: NodeJS.Timeout;
+	cancellation: vscode.CancellationTokenSource;
+	promise?: Promise<FlagView | undefined>;
 };
 
 class ReadFlagController implements vscode.Disposable {
@@ -115,36 +296,42 @@ class ReadFlagController implements vscode.Disposable {
 	);
 	private readonly status = vscode.window.createStatusBarItem('siglusSS.readFlags', vscode.StatusBarAlignment.Right, 99);
 	private modeEnabled = vscode.workspace.getConfiguration('siglusSS').get<boolean>('readFlagsMode') === true;
-	private readonly jobs = new Map<string, { timer?: NodeJS.Timeout; cancellation: vscode.CancellationTokenSource }>();
-	private readonly reports = new Map<string, ReadFlagReport>();
+	private readonly jobs = new Map<string, FlagJob>();
+	private readonly views = new Map<string, FlagView>();
+	private readonly painted = new WeakMap<vscode.TextEditor, vscode.Range[][]>();
 	private readonly subscriptions: vscode.Disposable[];
 	private connection: vscode.Disposable[] = [];
 	private languageClient: LanguageClient | undefined;
 	private savePath = '';
+	private canSetReadFlag?: boolean;
 
 	constructor() {
 		this.status.name = 'SiglusSS Read Flags';
 		this.status.command = 'siglusSS.readFlags';
 		this.subscriptions = [
-			vscode.window.onDidChangeActiveTextEditor(() => this.refresh()),
-			vscode.window.onDidChangeVisibleTextEditors(() => this.refresh()),
+			vscode.window.onDidChangeActiveTextEditor(() => this.syncVisible()),
+			vscode.window.onDidChangeVisibleTextEditors(() => this.syncVisible()),
 			vscode.window.onDidChangeWindowState((state) => {
 				if (state.focused) {
 					this.refresh();
 				}
 			}),
 			vscode.workspace.onDidChangeTextDocument((event) => {
-				if (isSiglusDocument(event.document) && event.contentChanges.length > 0) {
-					this.refresh(undefined, 250);
+				if (event.contentChanges.length > 0) {
+					this.sourceChanged(event.document, 250);
 				}
 			}),
 			vscode.workspace.onDidSaveTextDocument((document) => {
-				if (isSiglusDocument(document)) {
-					this.refresh();
+				if (this.modeEnabled && isSceneDocument(document) &&
+					vscode.window.visibleTextEditors.some((editor) => editor.document === document)) {
+					this.refresh(document);
 				}
 			}),
 			vscode.workspace.onDidCloseTextDocument((document) => {
 				this.invalidate(document.uri.toString());
+				if (this.modeEnabled && document.uri.fsPath.toLowerCase().endsWith('.inc')) {
+					this.includeChanged(document.uri, 0);
+				}
 				this.updateStatus();
 			}),
 			vscode.workspace.onDidChangeConfiguration((event) => {
@@ -166,7 +353,7 @@ class ReadFlagController implements vscode.Disposable {
 			if (event.newState === State.Running) {
 				this.refresh();
 			} else {
-				for (const uri of new Set([...this.jobs.keys(), ...this.reports.keys()])) {
+				for (const uri of new Set([...this.jobs.keys(), ...this.views.keys()])) {
 					this.invalidate(uri);
 				}
 				this.updateStatus();
@@ -176,7 +363,12 @@ class ReadFlagController implements vscode.Disposable {
 			const watcher = vscode.workspace.createFileSystemWatcher(
 				new vscode.RelativePattern(path.dirname(this.savePath), path.basename(this.savePath)),
 			);
+			const includes = vscode.workspace.createFileSystemWatcher('**/*.[iI][nN][cC]');
 			this.connection.push(
+				includes,
+				includes.onDidChange((uri) => this.includeChanged(uri, 200)),
+				includes.onDidCreate((uri) => this.includeChanged(uri, 200)),
+				includes.onDidDelete((uri) => this.includeChanged(uri, 200)),
 				watcher,
 				watcher.onDidChange(() => this.refresh(undefined, 200)),
 				watcher.onDidCreate(() => this.refresh(undefined, 200)),
@@ -193,45 +385,83 @@ class ReadFlagController implements vscode.Disposable {
 		this.connection = [];
 		this.languageClient = undefined;
 		this.savePath = '';
-		for (const uri of new Set([...this.jobs.keys(), ...this.reports.keys()])) {
+		for (const uri of new Set([...this.jobs.keys(), ...this.views.keys()])) {
 			this.invalidate(uri);
 		}
 		this.updateStatus();
 	}
 
-	refresh(document?: vscode.TextDocument, delay = 0): void {
-		if (!document) {
-			const documents = new Set(vscode.window.visibleTextEditors.map((editor) => editor.document));
-			const visibleUris = new Set([...documents].map((candidate) => candidate.uri.toString()));
-			for (const uri of new Set([...this.jobs.keys(), ...this.reports.keys()])) {
-				if (!visibleUris.has(uri)) {
-					this.invalidate(uri);
+	private syncVisible(): void {
+		const documents = new Set(vscode.window.visibleTextEditors.map((editor) => editor.document));
+		const visible = new Set([...documents].map((document) => document.uri.toString()));
+		for (const uri of new Set([...this.jobs.keys(), ...this.views.keys()])) {
+			if (!visible.has(uri)) {
+				this.invalidate(uri);
+			}
+		}
+		for (const document of documents) {
+			const uri = document.uri.toString();
+			const view = this.views.get(uri);
+			if (view) {
+				this.paint(uri, view.index);
+			} else {
+				this.paint(uri);
+				if (!this.jobs.has(uri)) {
+					this.refresh(document);
 				}
 			}
-			for (const candidate of documents) {
-				this.refresh(candidate, delay);
+		}
+		this.updateStatus();
+	}
+
+	private sourceChanged(document: vscode.TextDocument, delay: number): void {
+		if (!this.modeEnabled || !isSiglusDocument(document)) {
+			return;
+		}
+		if (document.uri.fsPath.toLowerCase().endsWith('.inc')) {
+			this.includeChanged(document.uri, delay);
+		} else if (vscode.window.visibleTextEditors.some((editor) => editor.document === document)) {
+			this.refresh(document, delay, true);
+		}
+	}
+
+	private includeChanged(uri: vscode.Uri, delay: number): void {
+		const directory = path.dirname(uri.fsPath);
+		for (const document of new Set(vscode.window.visibleTextEditors.map((editor) => editor.document))) {
+			if (path.relative(directory, path.dirname(document.uri.fsPath)) === '') {
+				this.refresh(document, delay, true);
+			}
+		}
+	}
+
+	refresh(document?: vscode.TextDocument, delay = 0, sourceChanged = false, verifySave = false): void {
+		if (!document) {
+			for (const visible of new Set(vscode.window.visibleTextEditors.map((editor) => editor.document))) {
+				this.refresh(visible, delay, false, true);
 			}
 			this.updateStatus();
 			return;
 		}
 		const uri = document.uri.toString();
-		this.invalidate(uri);
+		verifySave ||= this.jobs.get(uri)?.verifySave === true;
+		if (sourceChanged) {
+			this.invalidate(uri);
+		} else {
+			this.cancelJob(uri);
+		}
 		if (
 			!this.modeEnabled || !this.savePath || !this.languageClient?.isRunning() ||
 			this.languageClient.initializeResult?.capabilities.experimental?.siglusReadFlags?.version !== 1 ||
-			document.languageId !== 'siglusss' || !isSiglusDocument(document) ||
-			!document.uri.fsPath.toLowerCase().endsWith('.ss')
+			!isSceneDocument(document)
 		) {
 			return;
 		}
-		const cancellation = new vscode.CancellationTokenSource();
-		this.jobs.set(uri, {
-			timer: setTimeout(() => { void this.request(document, cancellation); }, delay),
-			cancellation,
-		});
+		const job: FlagJob = { cancellation: new vscode.CancellationTokenSource(), verifySave };
+		this.jobs.set(uri, job);
+		job.timer = setTimeout(() => { void this.currentReport(document); }, delay);
 	}
 
-	private invalidate(uri: string): void {
+	private cancelJob(uri: string): void {
 		const job = this.jobs.get(uri);
 		if (job) {
 			clearTimeout(job.timer);
@@ -239,13 +469,12 @@ class ReadFlagController implements vscode.Disposable {
 			job.cancellation.dispose();
 			this.jobs.delete(uri);
 		}
-		this.reports.delete(uri);
-		for (const editor of vscode.window.visibleTextEditors) {
-			if (editor.document.uri.toString() === uri) {
-				for (const decoration of this.decorations) {
-					editor.setDecorations(decoration, []);
-				}
-			}
+	}
+
+	private invalidate(uri: string): void {
+		this.cancelJob(uri);
+		if (this.views.delete(uri)) {
+			this.paint(uri);
 		}
 	}
 
@@ -278,90 +507,170 @@ class ReadFlagController implements vscode.Disposable {
 		}
 	}
 
-	async goToFirstUnreadFlag(): Promise<void> {
-		if (!this.modeEnabled) {
-			void vscode.window.showInformationMessage('Click the Read Flags status item and choose Enable Read Flags Mode first.');
-			return;
-		}
+	async sceneAction(action: UnreadNavigation | 'read' | 'unread', resource?: vscode.Uri): Promise<void> {
 		const editor = vscode.window.activeTextEditor;
-		if (!editor || editor.document.languageId !== 'siglusss' || !isSiglusDocument(editor.document) ||
-			!editor.document.uri.fsPath.toLowerCase().endsWith('.ss')) {
-			void vscode.window.showInformationMessage('Open a SiglusSS scene (.ss) to go to its first unread flag.');
+		if (!editor || !isSceneDocument(editor.document) ||
+			(resource && resource.toString() !== editor.document.uri.toString())) {
 			return;
 		}
-		if (!this.savePath) {
-			void vscode.window.showInformationMessage('Click the Read Flags status item and choose Select Read Save first.');
+		if (!this.modeEnabled || !this.savePath) {
+			void vscode.window.showInformationMessage('Enable Read Flags mode and select read.sav in the Read Flags status menu.');
 			return;
 		}
-		const languageClient = this.languageClient;
-		if (!languageClient?.isRunning()) {
+		const client = this.languageClient;
+		if (!client?.isRunning()) {
 			void vscode.window.showWarningMessage('The SiglusSS language server is not running.');
 			return;
 		}
-		if (languageClient.initializeResult?.capabilities.experimental?.siglusReadFlags?.version !== 1) {
-			void vscode.window.showWarningMessage('The configured siglus-ssu build does not support read-flag navigation.');
+		const capability = client.initializeResult?.capabilities.experimental?.siglusReadFlags;
+		const supportsBatch = capability?.setReadFlags === true;
+		const writing = action === 'read' || action === 'unread';
+		if (capability?.version !== 1 || (writing && !supportsBatch && !capability.setReadFlag)) {
+			void vscode.window.showWarningMessage('The configured siglus-ssu build does not support this read-flag action.');
 			return;
 		}
 		const document = editor.document;
 		const uri = document.uri.toString();
-		this.invalidate(uri);
-		const cancellation = new vscode.CancellationTokenSource();
-		this.jobs.set(uri, { cancellation });
-		this.updateStatus();
-		const report = await this.request(document, cancellation);
-		if (!report || vscode.window.activeTextEditor !== editor || this.languageClient !== languageClient ||
-			!languageClient.isRunning() || document.version !== report.version || this.reports.get(uri) !== report) {
+		const version = document.version;
+		const selections = editor.selections;
+		const cursor = document.offsetAt(editor.selection.active);
+		const view = await this.currentReport(document);
+		if (!view || !this.isCurrent(editor, client, version) || this.views.get(uri) !== view ||
+			selections.length !== editor.selections.length || selections.some((s, i) =>
+				!s.anchor.isEqual(editor.selections[i].anchor) || !s.active.isEqual(editor.selections[i].active))) {
 			return;
 		}
-		if (report.status !== 'matched') {
-			void vscode.window.showWarningMessage(`Cannot locate the first unread flag. ${this.mappingMessage(report)}`);
+		const { index, report } = view;
+		if (!index) {
+			void vscode.window.showWarningMessage(this.mappingMessage(report));
 			return;
 		}
-		const first = report.items.find((item) => !item.read);
-		if (!first) {
-			void vscode.window.showInformationMessage(report.flagCount === 0
-				? 'This scene has no read flags.' : 'All flags in this scene are marked as read.');
+		if (!writing) {
+			const target = index.unreadRange(action, cursor);
+			if (target) {
+				editor.selection = new vscode.Selection(target.end, target.start);
+				editor.revealRange(target, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+			} else if (!index.firstUnread) {
+				void vscode.window.showInformationMessage(report.flagCount === 0
+					? 'This scene has no read flags.' : 'All flags in this scene are marked as read.');
+			} else if (action === 'previous' || action === 'next') {
+				const side = action === 'previous' ? 'before' : 'after';
+				void vscode.window.showInformationMessage(`There is no unread flag with a source location ${side} the cursor.`);
+			} else {
+				const flag = action === 'first' ? index.firstUnread : index.lastUnread;
+				if (flag) {
+					void vscode.window.showWarningMessage(`The ${action} unread flag (${flag.index}) has no precise source location.`);
+				}
+			}
 			return;
 		}
-		if (first.ranges.length === 0) {
-			void vscode.window.showWarningMessage(`The first unread flag (${first.index}) has no precise source location.`);
+		const flags = index.flagsAt(document, selections);
+		if (flags.length === 0) {
+			void vscode.window.showInformationMessage(selections.some((selection) => !selection.isEmpty)
+				? 'There are no read flags in the selection.'
+				: 'There is no read flag at this position.');
 			return;
 		}
-		const range = first.ranges.reduce((earliest, candidate) =>
-			candidate.start.line < earliest.start.line ||
-			(candidate.start.line === earliest.start.line && candidate.start.character < earliest.start.character)
-				? candidate : earliest,
-		);
-		const target = languageClient.protocol2CodeConverter.asRange(range);
-		editor.selection = new vscode.Selection(target.start, target.end);
-		editor.revealRange(target, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+		let indices = flags.map((flag) => flag.index);
+		if (flags.length > 1 && selections.length === 1 && selections[0].isEmpty) {
+			flags.sort((a, b) => a.index - b.index);
+			const choice = await vscode.window.showQuickPick(flags.map(({ index, read }) => ({
+				label: 'Flag ' + index, description: read ? 'Read' : 'Unread', index,
+			})), { title: 'Choose the flag to mark as ' + action });
+			if (!choice || !this.isCurrent(editor, client, version) || this.views.get(uri)?.index !== index) {
+				return;
+			}
+			indices = [choice.index];
+		}
+		if (!supportsBatch && indices.length > 1) {
+			void vscode.window.showWarningMessage('Update siglus-ssu to mark multiple flags at once.');
+			return;
+		}
+		const read = action === 'read';
+		const method = supportsBatch ? 'siglus/setReadFlags' : 'siglus/setReadFlag';
+		const target = supportsBatch ? { indices } : { index: indices[0] };
+		try {
+			const result = await client.sendRequest<ReadFlagReport & { previousRevision?: string }>(method, {
+				textDocument: { uri, version }, mappingId: report.mappingId, ...target, read,
+			});
+			if (this.languageClient !== client || document.isClosed) {
+				return;
+			}
+			const current = this.views.get(uri);
+			if (result.status === 'matched' && document.version === version && result.version === version &&
+				result.uri === uri && current?.index === index && result.mappingId === current.report.mappingId &&
+				result.previousRevision === current.report.saveRevision) {
+				this.cancelJob(uri);
+				index.update({ indices, read });
+				this.views.set(uri, { index, report: result });
+				this.paint(uri, index);
+				this.updateStatus();
+			} else {
+				if (result.status !== 'matched') {
+					void vscode.window.showWarningMessage(this.mappingMessage(result));
+				}
+				this.refresh();
+			}
+		} catch (error) {
+			void vscode.window.showErrorMessage('Failed to update read.sav. ' + toErrorMessage(error));
+			this.refresh();
+		}
 	}
 
-	private async request(document: vscode.TextDocument, cancellation: vscode.CancellationTokenSource): Promise<ReadFlagReport | undefined> {
+	private isCurrent(editor: vscode.TextEditor, client: LanguageClient, version: number): boolean {
+		return vscode.window.activeTextEditor === editor && !editor.document.isClosed &&
+			editor.document.version === version && this.languageClient === client && client.isRunning();
+	}
+
+	private currentReport(document: vscode.TextDocument): Promise<FlagView | undefined> {
+		const uri = document.uri.toString();
+		let job = this.jobs.get(uri);
+		if (!job) {
+			job = { cancellation: new vscode.CancellationTokenSource() };
+			this.jobs.set(uri, job);
+		}
+		clearTimeout(job.timer);
+		job.promise ??= this.request(document, job.cancellation, job.verifySave);
+		return job.promise;
+	}
+
+	private async request(document: vscode.TextDocument, cancellation: vscode.CancellationTokenSource, verifySave = false): Promise<FlagView | undefined> {
 		const languageClient = this.languageClient;
 		const uri = document.uri.toString();
 		const version = document.version;
 		try {
-			if (!this.modeEnabled || !languageClient || cancellation.token.isCancellationRequested) {
+			if (!languageClient || cancellation.token.isCancellationRequested) {
 				return;
 			}
-			const report = await languageClient.sendRequest<ReadFlagReport>(
-				'siglus/readFlags', { textDocument: { uri } }, cancellation.token,
-			);
-			if (
-				this.jobs.get(uri)?.cancellation !== cancellation || document.isClosed ||
-				document.version !== version || report.uri !== uri || report.version !== version
-			) {
+			const previous = this.views.get(uri);
+			const report = await languageClient.sendRequest<ReadFlagReport>('siglus/readFlags', {
+				textDocument: { uri }, mappingId: previous?.report.mappingId, saveRevision: previous?.report.saveRevision, verifySave,
+			}, cancellation.token);
+			if (this.jobs.get(uri)?.cancellation !== cancellation || document.isClosed ||
+				document.version !== version || report.uri !== uri || report.version !== version) {
 				return;
 			}
-			this.reports.set(uri, report);
-			this.paint(document, report);
-			return report;
+			let index: ReadFlagIndex | undefined;
+			if (report.status === 'matched') {
+				if (previous?.index && report.mappingId && previous.report.mappingId === report.mappingId) {
+					index = previous.index;
+					if (report.states !== undefined) {
+						index.update(Buffer.from(report.states, 'base64'));
+					}
+				} else {
+					index = new ReadFlagIndex(report.items, document, languageClient);
+				}
+			}
+			const view = { report, index };
+			this.views.set(uri, view);
+			this.paint(uri, index);
+			return view;
 		} catch (error) {
 			if (!cancellation.token.isCancellationRequested && this.jobs.get(uri)?.cancellation === cancellation) {
-				const failure = { uri, version, status: 'requestFailed', message: toErrorMessage(error), items: [] };
-				this.reports.set(uri, failure);
-				getServerOutputChannel().warn(`Read flags: ${toErrorMessage(error)}`);
+				const failure = { report: { uri, version, status: 'requestFailed', message: toErrorMessage(error), items: [] } };
+				this.views.set(uri, failure);
+				this.paint(uri);
+				getServerOutputChannel().warn('Read flags: ' + toErrorMessage(error));
 				return failure;
 			}
 		} finally {
@@ -373,49 +682,24 @@ class ReadFlagController implements vscode.Disposable {
 		}
 	}
 
-	private paint(document: vscode.TextDocument, report: ReadFlagReport): void {
-		const ranges: vscode.Range[][] = [[], [], []];
-		const languageClient = this.languageClient;
-		if (this.modeEnabled && languageClient && report.status === 'matched' && report.version === document.version) {
-			const events = new Map<number, [number, number]>();
-			for (const item of report.items) {
-				const state = item.read ? 0 : 1;
-				for (const range of item.ranges) {
-					const converted = languageClient.protocol2CodeConverter.asRange(range);
-					const start = document.offsetAt(converted.start);
-					const end = document.offsetAt(converted.end);
-					if (start >= end) {
-						continue;
-					}
-					const opening = events.get(start) ?? [0, 0];
-					const closing = events.get(end) ?? [0, 0];
-					opening[state] += 1;
-					closing[state] -= 1;
-					events.set(start, opening);
-					events.set(end, closing);
-				}
-			}
-			let read = 0;
-			let unread = 0;
-			let previous = 0;
-			for (const [offset, delta] of [...events].sort(([left], [right]) => left - right)) {
-				if (offset > previous && (read > 0 || unread > 0)) {
-					const state = read > 0 ? unread > 0 ? 2 : 0 : 1;
-					ranges[state].push(new vscode.Range(document.positionAt(previous), document.positionAt(offset)));
-				}
-				read += delta[0];
-				unread += delta[1];
-				previous = offset;
-			}
-		}
+	private paint(uri: string, index?: ReadFlagIndex): void {
 		for (const editor of vscode.window.visibleTextEditors) {
-			if (editor.document === document) {
-				this.decorations.forEach((decoration, state) => editor.setDecorations(decoration, ranges[state]));
+			if (editor.document.uri.toString() !== uri || this.painted.get(editor) === index?.decorations) {
+				continue;
+			}
+			this.decorations.forEach((decoration, state) => editor.setDecorations(decoration, index?.decorations[state] ?? []));
+			if (index) {
+				this.painted.set(editor, index.decorations);
+			} else {
+				this.painted.delete(editor);
 			}
 		}
 	}
 
 	private mappingMessage(report: ReadFlagReport | undefined): string {
+		if (report?.status === 'sourceChanged') {
+			return 'The source mapping changed. Try the command again.';
+		}
 		return report?.status === 'countMismatch'
 			? `Flag count mismatch: source ${report.flagCount}, save ${report.savedFlagCount}. Saved states were not applied.`
 			: report?.status === 'missingScene'
@@ -424,14 +708,20 @@ class ReadFlagController implements vscode.Disposable {
 	}
 
 	private updateStatus(): void {
+		const capability = this.languageClient?.initializeResult?.capabilities.experimental?.siglusReadFlags;
+		const writable = Boolean(this.modeEnabled && this.savePath && this.languageClient?.isRunning() &&
+			capability?.version === 1 && (capability.setReadFlags || capability.setReadFlag));
+		if (writable !== this.canSetReadFlag) {
+			this.canSetReadFlag = writable;
+			void vscode.commands.executeCommand('setContext', 'siglusSS.canSetReadFlag', writable);
+		}
 		const document = vscode.window.activeTextEditor?.document;
-		if (!document || document.languageId !== 'siglusss' || !isSiglusDocument(document) ||
-			!document.uri.fsPath.toLowerCase().endsWith('.ss')) {
+		if (!document || !isSceneDocument(document)) {
 			this.status.hide();
 			return;
 		}
 		const uri = document.uri.toString();
-		const report = this.reports.get(uri);
+		const report = this.views.get(uri)?.report;
 		if (!this.modeEnabled) {
 			this.status.text = '$(book) Read Flags: Off';
 			this.status.tooltip = 'Read Flags mode is off. The selected save path is kept.';
@@ -449,7 +739,7 @@ class ReadFlagController implements vscode.Disposable {
 			this.status.tooltip = `Loading saved flags from ${this.savePath}`;
 		} else if (report?.status === 'matched') {
 			this.status.text = `$(book) Read Flags: ${report.readCount}/${report.flagCount}`;
-			this.status.tooltip = `${this.savePath}\nRead: ${report.readCount}; unread: ${report.unreadCount}.\nDefault backgrounds: light blue = read; strong red = unread; violet = overlapping read and unread flags.\nHover the highlighted fragment for individual flag states. Use the scene editor's context menu to go to its first unread flag.`;
+			this.status.tooltip = `${this.savePath}\nRead: ${report.readCount}; unread: ${report.unreadCount}.\nDefault backgrounds: light blue = read; strong red = unread; violet = overlapping read and unread flags.\nHover the highlighted fragment for individual flag states. Right-click to jump to an unread flag or mark the flags in a selection.`;
 		} else {
 			this.status.text = `$(warning) Read Flags: ${report?.status ?? 'Unavailable'}`;
 			this.status.tooltip = `${this.savePath}\n${this.mappingMessage(report)}`;
@@ -560,16 +850,14 @@ async function queryConstProfiles(commandSpec: CommandSpec): Promise<ConstProfil
 	const commandKey = JSON.stringify(commandSpec);
 	constProfileCatalog = undefined;
 	// --version exits without starting an LSP even if a future CLI accepts the probe value.
-	const validationOutput = await runProcess(commandSpec.command, [...commandSpec.args, '--const-profile', '-1', '--version'], {
-		cwd: commandSpec.cwd,
-		acceptedExitCodes: [2],
-		timeoutMs: 10000,
-	});
-	const helpOutput = await runProcess(commandSpec.command, [...commandSpec.args, '--help'], {
-		cwd: commandSpec.cwd,
-		stdoutOnly: true,
-		timeoutMs: 10000,
-	});
+	const [validationOutput, helpOutput] = await Promise.all([
+		runProcess(commandSpec.command, [...commandSpec.args, '--const-profile', '-1', '--version'], {
+			cwd: commandSpec.cwd, acceptedExitCodes: [2], timeoutMs: 10000,
+		}),
+		runProcess(commandSpec.command, [...commandSpec.args, '--help'], {
+			cwd: commandSpec.cwd, stdoutOnly: true, timeoutMs: 10000,
+		}),
+	]);
 	const value = parseConstProfileCatalog(validationOutput, helpOutput);
 	if (JSON.stringify(resolveCommandSpec(getConfiguredPath())) === commandKey) {
 		constProfileCatalog = { commandKey, value };
@@ -749,6 +1037,11 @@ function resolveCommandSpec(configuredPath: string): CommandSpec {
 	};
 }
 
+function isSceneDocument(document: vscode.TextDocument): boolean {
+	return document.languageId === 'siglusss' && isSiglusDocument(document) &&
+		document.uri.fsPath.toLowerCase().endsWith('.ss');
+}
+
 function isSiglusDocument(document: vscode.TextDocument): boolean {
 	if (document.uri.scheme !== 'file' || document.isUntitled) {
 		return false;
@@ -808,19 +1101,17 @@ async function detectSiglusEncoding(uri: vscode.Uri): Promise<SiglusEncoding> {
 	const bytes = await vscode.workspace.fs.readFile(uri);
 	const hadBom =
 		bytes.byteLength >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf;
+	const bom = hadBom ? await decodeCandidate(bytes, 'utf8bom') : undefined;
+	if (bom?.text !== undefined) {
+		return bom.encoding;
+	}
 	const shiftJis = await decodeCandidate(bytes, 'shiftjis');
-	const utf8 = await decodeCandidate(bytes, hadBom ? 'utf8bom' : 'utf8');
-	if (hadBom && utf8.text !== undefined) {
-		return utf8.encoding;
-	}
-	if (shiftJis.exact && !utf8.exact) {
+	if (shiftJis.exact) {
 		return shiftJis.encoding;
 	}
-	if (utf8.exact && !shiftJis.exact) {
+	const utf8 = bom ?? await decodeCandidate(bytes, 'utf8');
+	if (utf8.exact) {
 		return utf8.encoding;
-	}
-	if (shiftJis.exact && utf8.exact) {
-		return shiftJis.encoding;
 	}
 	if (shiftJis.text === undefined) {
 		return utf8.text === undefined ? 'shiftjis' : utf8.encoding;
@@ -1574,7 +1865,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand('siglusSS.selectConstProfile', selectConstProfile),
 		vscode.commands.registerCommand('siglusSS.readFlags', () => readFlagController?.showMenu()),
 		vscode.commands.registerCommand('siglusSS.refreshReadFlags', () => readFlagController?.refresh()),
-		vscode.commands.registerCommand('siglusSS.goToFirstUnreadFlag', () => readFlagController?.goToFirstUnreadFlag()),
+		vscode.commands.registerCommand('siglusSS.goToFirstUnreadFlag', (uri?: vscode.Uri) => readFlagController?.sceneAction('first', uri)),
+		vscode.commands.registerCommand('siglusSS.goToPreviousUnreadFlag', (uri?: vscode.Uri) => readFlagController?.sceneAction('previous', uri)),
+		vscode.commands.registerCommand('siglusSS.goToNextUnreadFlag', (uri?: vscode.Uri) => readFlagController?.sceneAction('next', uri)),
+		vscode.commands.registerCommand('siglusSS.goToLastUnreadFlag', (uri?: vscode.Uri) => readFlagController?.sceneAction('last', uri)),
+		vscode.commands.registerCommand('siglusSS.markFlagRead', (uri?: vscode.Uri) => readFlagController?.sceneAction('read', uri)),
+		vscode.commands.registerCommand('siglusSS.markFlagUnread', (uri?: vscode.Uri) => readFlagController?.sceneAction('unread', uri)),
 	);
 	context.subscriptions.push(
 		vscode.workspace.onDidChangeConfiguration((event) => {
