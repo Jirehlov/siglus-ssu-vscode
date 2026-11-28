@@ -2,7 +2,7 @@
   "name": "siglus-ssu-vscode",
   "displayName": "SiglusSS Support",
   "description": "VS Code support for SiglusSceneScript via siglus-ssu.",
-  "version": "0.0.15",
+  "version": "0.0.16",
   "publisher": "Jirehlov",
   "license": "MIT",
   "repository": {
@@ -342,7 +342,7 @@
     "vscode:prepublish": "npm run compile"
   },
   "dependencies": {
-    "vscode-languageclient": "^10.1.0"
+    "vscode-languageclient": "^12.0.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
